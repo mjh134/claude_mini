@@ -1,0 +1,9 @@
+{
+  "_说明": "MCP 服务器清单。servers 里每加一条,agent 启动时就会拉起它、把它的工具并进来。字段含义见 mcp.py 开头的模块注释;下划线开头的键是给人看的,程序会忽略。command 不写默认用当前 Python 解释器,args 里的相对路径以本文件所在目录为准。",
+
+  "servers": {
+    "demo": {
+      "args": ["mcp_demo_server.py"]
+    }
+  }
+}
