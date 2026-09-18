@@ -1,0 +1,36 @@
+# ============================================================
+# 行尾策略:本仓库**不做任何规范化**,字节原样进出。
+#
+# 为什么:项目里 12 个 .py 是 CRLF、8 个是 LF;.md 也是 10 CRLF / 6 LF。
+# 这是历史形成的现状,不是待修的毛病。任何 text 规范化
+# (`* text=auto`、`*.py text eol=lf`)都会在检出时改写这些文件,
+# 让"按字节回退"失效 —— 例如 git checkout 一个文件后,内容就不再是原来那份。
+#
+# 靠什么保住:仓库级 core.autocrlf=false(它覆盖了系统级的 true,
+# 后者的来源是 C:/Program Files/Git/etc/gitconfig)。
+# 若哪天 clone 到别的机器,记得在那边也执行一次:
+#     git config core.autocrlf false
+#
+# 所以下面只标注真正的二进制类型,让 git 别去 diff / 合并它们。
+# **不要在这里加 text=auto。**
+# ============================================================
+
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.bmp   binary
+*.pdf   binary
+*.zip   binary
+*.7z    binary
+*.rar   binary
+*.xlsx  binary
+*.xls   binary
+*.docx  binary
+*.doc   binary
+*.pptx  binary
+*.exe   binary
+*.dll   binary
+*.so    binary
+*.pyd   binary
