@@ -14,6 +14,7 @@ from task import TaskStore,create_task_handlers
 from background import BackgroundManager
 from corn_job import Scheduler
 from message import Message
+from mcp import MCPManager
 from team import (TeamRuntime, KIND_CHAT, KIND_OFFLINE_REQ, KIND_OFFLINE_AGREE,
                   KIND_OFFLINE_REFUSE, ALIVE, EXITING, OFFLINE, DEAD,
                   is_chat, is_control)
@@ -30,13 +31,27 @@ OFFLINE_REQ_TEXT = ("主agent判断当前不再需要你,请做最终确认:如�
 
 class ClaudeMini():
 
-    def __init__(self,show_thinking=False,slient = True,allow_recall_memory=True,allow_subagent=True,allow_write_memory=True,task_store=None,scheduler=None,allow_jobs=True,message_bus=None,agent_name="main",allow_team=True,agent_id=None,team_runtime=None):
+    def __init__(self,show_thinking=False,slient = True,allow_recall_memory=True,allow_subagent=True,allow_write_memory=True,task_store=None,scheduler=None,allow_jobs=True,message_bus=None,agent_name="main",allow_team=True,agent_id=None,team_runtime=None,mcp=None):
 
         self.skill_loader = SkillLoader()
         self.compact_mannager = CompactManager()
         self.memory_manager = MemoryManager()
         self.background_manager = BackgroundManager()
-        self.tools = Tools
+
+        #工具表必须**新建一个列表**,不能像原来那样直接 self.tools = Tools:
+        #Tools 是 TOOLS.py 里的模块级列表,所有 agent 共用同一个对象。
+        #就地 += 把 MCP 工具追加上去,加的是那个全局列表 —— 之后每建一个 agent
+        #(每个子agent、每个团队成员)就再追加一遍,同一个工具名在 schema 里出现多次。
+        self.tools = list(Tools)
+
+        #注册表也提前到这里:下面要往里注册 MCP 工具,而 self.llm 又得先拿到 self.tools
+        self.tool_registry = create_default_registry()
+
+        #MCP:外部进程提供的工具,清单在同目录 mcp_servers.json。
+        #和 Scheduler / TaskStore 一样,整个 agent 树**共享同一个实例** ——
+        #每个 server 背后是一个子进程加一条读线程,这两样都复制不了(见 mcp.MCPManager)
+        self.mcp = mcp if mcp is not None else MCPManager()
+        self.tools += self._register_mcp_tools()
 
         # 加载长期记忆并注入 system prompt
         session_memory = self.memory_manager.load_session_memory()
@@ -57,7 +72,6 @@ class ClaudeMini():
 
         self.llm = LLM(self.system_prompt,self.tools)
 
-        self.tool_registry = create_default_registry()   
         self.tool_registry.register("subagent",self.run_subagent)
         self.tool_registry.register("load_skill",self.skill_loader.load)
         self.tool_registry.register("recall_memory",self.recall_memory)
@@ -387,7 +401,8 @@ class ClaudeMini():
                               allow_recall_memory=False, allow_jobs=False,
                               agent_name=name, agent_id=member.id,
                               message_bus=self.message_bus, team_runtime=runtime,
-                              task_store=self.task_store, scheduler=self.scheduler)
+                              task_store=self.task_store, scheduler=self.scheduler,
+                              mcp=self.mcp)
         thread = threading.Thread(target=teammate.run_forever, name=member.id, daemon=True)
         thread.start()
         runtime.update(member.id, agent=teammate, thread=thread)
@@ -745,7 +760,8 @@ class ClaudeMini():
         subagent = ClaudeMini(slient=False, allow_recall_memory=False,
                               allow_subagent=False, allow_write_memory=False,
                               task_store=self.task_store,
-                              scheduler=self.scheduler, allow_jobs=False)
+                              scheduler=self.scheduler, allow_jobs=False,
+                              mcp=self.mcp)
 
         history = [
             {
@@ -825,6 +841,20 @@ class ClaudeMini():
                     f"本工具接受的参数:{self._tool_params(block.name)}。请按这些参数名重新调用一次。")
         except Exception as e:
             return f"❌ 工具 {block.name} 执行出错:{type(e).__name__}: {e}"
+
+    def _register_mcp_tools(self):
+        """注册 MCP 工具,并返回它们的 schema(要交给 LLM)。放在 __init__ 里被调一次。
+
+        两件事缺一不可:注册处理函数(调得动)+ schema 进 self.tools(模型看得见)。
+        只做前一半,模型不知道有这个工具;只做后一半,模型一调就是 Unknown tool。
+
+        哪些工具最终留得下(和原生工具撞名的会被剔掉)由 MCPManager.collect 统一裁决,
+        所以注册和 schema 天然是同一个集合 —— 不会出现"注册了却没说"或"说了却调不动"。
+        """
+        schemas, handlers = self.mcp.collect(reserved={t["name"] for t in Tools})
+        for name, handler in handlers.items():
+            self.tool_registry.register(name, handler)
+        return schemas
 
     def _tool_params(self, name):
         """从工具 schema 里取参数名 —— 报错时要把它回给模型,模型记不住 schema 写了什么"""

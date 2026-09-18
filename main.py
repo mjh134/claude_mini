@@ -73,4 +73,8 @@ if __name__ == "__main__":
 
     # 整个会话结束:经验记忆达到阈值时,交给模型做一次去重整理(LLM 驱动;失败不阻断退出)
     claude_mini.memory_manager.consolidate_if_due(claude_mini.llm)
+
+    # 收掉 MCP 服务器子进程。Python 退出不会顺手杀子进程,不收它们会挂在后台等 stdin
+    #(MCPManager 里还挂了 atexit 兜底,这里显式收一次是为了"正常退出就干净",不指望兜底)
+    claude_mini.mcp.close()
     
