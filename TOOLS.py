@@ -168,7 +168,7 @@ Tools = [
     {
         "name": "job_create",
         "description": (
-            "创建一个定时任务,到点后系统会自动唤醒你去执行它。"
+            "创建一个定时任务,到点后系统会自动在独立的后台 agent 里执行它 —— 不需要你参与执行。"
             "触发方式二选一,必须给且只能给一个:"
             "① schedule —— 周期性触发,类 linux cron 五段式「分 时 日 月 周」。"
             "用户说「每天9点…」「每小时…」「每周五…」时用它:"
@@ -180,7 +180,9 @@ Tools = [
             "若本次会话已开了很久(跨天)可能已过期,可用 bash 执行 date +'%Y-%m-%d %H:%M' 复核。"
             "两种任务跑完一轮后都不需要你做任何事:周期任务下次到点会自动再派发,"
             "一次性任务则就此结束,你不要为了「让它继续跑」而重复创建任务。"
-            "content 要写清楚「做什么」——到点后是照着这句话执行,不依赖当前对话上下文。"
+            "content 要写清楚「做什么」——到点后是照着这句话执行,不依赖当前对话上下文;"
+            "执行时没有用户在终端,需要用户确认的操作(写记忆、覆盖已有文件等)会被直接拒绝,"
+            "要让任务产出能看见,就在 content 里写明把结果写进某个文件。"
         ),
         "input_schema": {
             "type": "object",
@@ -208,7 +210,7 @@ Tools = [
         "description": (
             "取消一个定时任务:它不再被调度执行,但记录保留在任务库里(状态变为 cancelled),"
             "之后可以随时用 job_resume 恢复。适合「先别跑了,但我想留着」的场景。"
-            "执行中(running)的任务取消不了(已经领走在跑,拦不住),那种情况用 job_delete。"
+            "执行中(running)的任务取消不了(后台正在跑,拦不住),那种情况用 job_delete。"
         ),
         "input_schema": {
             "type": "object",
@@ -236,7 +238,7 @@ Tools = [
         "name": "job_delete",
         "description": (
             "删除一个定时任务:任务连同记录一起从任务库移除,不可恢复、没有后悔余地。"
-            "适合「这个任务我不要了」,或清理卡在 running 的僵尸任务。"
+            "适合「这个任务我不要了」。"
             "只是暂时不想让它跑、以后还想再开,请用 job_cancel(可恢复);"
             "用户说要「删掉」时如果拿不准是不是想留着,先问一句。"
         ),
@@ -249,51 +251,52 @@ Tools = [
         }
     },
     {
-        "name": "job_take",
-        "description": (
-            "从定时任务队列取出一个已到执行时间的任务,取走后该任务状态变为 running。"
-            "队列为空时返回「暂无待执行任务」。"
-            "取出后请立即按 content 描述的内容执行,"
-            "并根据执行结果调用 job_update_status 汇报,不要一直占着不汇报。"
-        ),
-        "input_schema": {"type": "object", "properties": {}}
-    },
-    {
-        "name": "job_update_status",
-        "description": (
-            "汇报定时任务的执行结果并修改其状态。"
-            "任务执行完必须调用本工具,否则该任务会一直停留在 running,之后不再被调度。"
-            "只接受 running → completed(执行成功)/ running → failed(执行失败)。"
-            "注意:这两个状态说的是「这一轮」跑完了,不是「这个任务结束了」——"
-            "周期任务下次到点会自动重新派发,一次性任务跑完才会就此结束,"
-            "两种情况都不需要你重新创建任务。"
-        ),
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "job_id": { "type": "string", "description": "任务id(job_开头)" },
-                "status": {
-                    "type": "string",
-                    "enum": ["completed", "failed"],
-                    "description": "执行结果:成功 completed / 失败 failed"
-                }
-            },
-            "required": ["job_id", "status"]
-        }
-    },
-    {
         "name":"subagent",
-        "description":"启动一个独立子agent执行指定任务。",
+        "description":(
+            "启动一个独立子agent执行指定任务。"
+            "默认前台执行:当前agent会一直等到它跑完,结果当场返回。"
+        ),
         "input_schema":{
             "type":"object",
             "properties":{
                 "prompt":{
                     "type":"string",
                     "description":"描述需要子agent完成的具体任务，包括目标和期望结果"
+                },
+                "is_background":{
+                    "type":"boolean",
+                    "description":
+                        "是否在后台执行。"
+                        "对于预计耗时较长、或与当前任务无关、不必立刻拿到结果的任务,设置为true。"
+                        "后台子agent会立即返回任务ID,当前agent无需等待,可以接着干别的活。"
+                        "它跑完后系统会把结果以 <task_notification> 自动推送回来,"
+                        "不需要自行 sleep 或轮询等待。"
+                        "注意两点:① 后台子agent不在主线程上,弹不出确认窗口问用户,"
+                        "所以需要用户批准的操作(写记忆、覆盖已有文件等)会被直接拒绝 —— "
+                        "这类任务要么保持false走前台,要么改写成不需要批准的形式;"
+                        "② 能同时在后台跑的子agent数量有上限,交满了这次提交会被拒绝,"
+                        "那就等前面的跑完再交,或者自己前台做。"
                 }
             },
             "required":["prompt"]
         }
+    },
+    {
+        "name": "bg_status",
+        "description": (
+            "查看后台任务现在怎么样:哪些还在跑、各跑了多久、后台子agent还能不能再交。"
+            "这里的「后台任务」专指 is_background=true 提交的那些(bash 命令和子agent),"
+            "它们跑完会自动以 <task_notification> 推给你。"
+            "**不要用它等结果**:反复调用它去轮询只是白烧 token,结果会自己来。"
+            "该用的场合只有三个:"
+            "① 某个后台任务很久没动静,你想确认它到底还在不在跑(输出里有已跑时长,"
+            "跑得异常久就是卡住的信号);"
+            "② 想再交一个后台子agent之前,先确认还有没有名额,免得白提交一次被拒;"
+            "③ 用户问「那个后台任务怎么样了」。"
+            "注意别和 task_list 搞混:task_list 里的是你**自己规划的待办节点**(task_ 开头),"
+            "和线程、执行没有任何关系;后台任务的 id 是 bg_ 开头。"
+        ),
+        "input_schema": {"type": "object", "properties": {}}
     },
     {
         "name":"load_skill",
@@ -446,9 +449,12 @@ ROLE_MAIN = "main"
 ROLE_SUBAGENT = "subagent"
 ROLE_MEMBER = "team_member"
 
-#定时任务这 7 个:统一由主agent管。扫描线程和锁都不可复制,子agent领了会重复执行同一件事
+#定时任务这 5 个:统一由主agent管。扫描线程和锁都不可复制,子agent建了会各扫各的。
+#只有"建/查/取消/恢复/删"这些**管理**动作 —— 到点执行不再由模型经手:
+#派发器自动取走任务、在独立后台 agent 里跑完、把结果汇报回 Scheduler(见 dispatcher.py)。
+#原来那两个 job_take / job_update_status 就是"模型自己领任务"的入口,已随旧设计删除
 JOB_TOOLS = frozenset({"job_create", "job_list", "job_cancel", "job_resume",
-                       "job_delete", "job_take", "job_update_status"})
+                       "job_delete"})
 
 #团队这 5 个:要有消息总线、要有一张成员表才有意义。
 #子agent是一次性的、没有信箱,整组禁掉

@@ -14,24 +14,22 @@ _SEARCH_DAYS = 366 * 8
 
 # 任务五态(待执行 / 执行中 / 已完成 / 已失败 / 已取消)
 JOB_PENDING = "pending"        # 已创建,等待到点派发
-JOB_RUNNING = "running"        # 已被 agent 取走执行
+JOB_RUNNING = "running"        # 已被派发器取走执行
 JOB_COMPLETED = "completed"    # 本次执行成功
 JOB_FAILED = "failed"          # 本次执行失败
 JOB_CANCELLED = "cancelled"    # 已取消:不再被调度,记录保留(可 resume 恢复)
 
 # 合法状态流转表:当前状态 -> 允许切换到的状态(状态修改的唯一依据)
 JOB_TRANSITIONS = {
-    JOB_PENDING:   {JOB_RUNNING, JOB_CANCELLED},  # 被 agent 取走执行 / 被取消
-    JOB_RUNNING:   {JOB_COMPLETED, JOB_FAILED},   # 执行成功 / 失败(执行中不可取消)
+    JOB_PENDING:   {JOB_RUNNING, JOB_CANCELLED},  # 被派发执行 / 被取消
+    # running → pending 有两条路,都不是模型能走的(没有任何工具能改任务状态了):
+    # ① 派发时名额被抢光,任务原样放回(requeue_job)
+    # ② 上次进程是在这个任务执行中崩的,启动时回收僵尸(_load)
+    JOB_RUNNING:   {JOB_COMPLETED, JOB_FAILED, JOB_PENDING},
     JOB_COMPLETED: {JOB_PENDING, JOB_CANCELLED},  # 周期任务:下一轮重新待执行 / 被取消
     JOB_FAILED:    {JOB_PENDING, JOB_CANCELLED},  # 同上:失败也等下一轮再跑 / 被取消
     JOB_CANCELLED: {JOB_PENDING},                 # 恢复:重新放回调度池(resume_job)
 }
-
-# 工具(job_update_status)允许模型汇报的状态白名单
-# 不含 pending:completed/failed → pending 是 tick 给周期任务开新一轮用的内部边,
-# 放开它模型就能把跑完的任务「复活」。流转表管「能不能变」,这里管「准不准报」
-JOB_REPORTABLE = {JOB_COMPLETED, JOB_FAILED}
 
 # schedule 五段及各自取值区间:分 时 日 月 周(周:0=周日,7 也写作周日)
 _CRON_FIELDS = (("minute", 0, 59), ("hour", 0, 23), ("day", 1, 31),
@@ -160,8 +158,12 @@ class Scheduler:
     def __init__(self, store_path: str):
         self.store_path = Path(store_path)  #任务库文件:启动加载、每次变更写回
         self.jobs = {}      # id -> Job
-        self.queue = []     #已到点、等待 agent 取走的任务(派生状态,不落盘)
-        self.lock = threading.Lock()   #扫描线程与 agent 线程都会碰 jobs/queue/文件
+        self.queue = []     #已到点、等待派发的任务(派生状态,不落盘)
+        #job_id -> 这次派发消耗掉的到点时刻。派生状态,不落盘 ——
+        #它的唯一用途是"放回"时把 next_run 还原成当初那个时刻:next_run 在 take_job 里
+        #就推进过了,不还原的话这次派发就白丢(一次性任务会直接变成永远不会再触发的哑巴)
+        self.inflight = {}
+        self.lock = threading.Lock()   #扫描线程与派发线程都会碰 jobs/queue/文件
         self._thread = None    #扫描线程,start() 靠它防重入
         self._load()
 
@@ -181,11 +183,25 @@ class Scheduler:
                 #单条任务损坏(如手改坏了 schedule)只跳过它,不该拖垮整个调度器
                 print(f"[scheduler] 跳过无法加载的任务 {job_id}: {e}")
                 continue
+            #僵尸回收:盘上还写着 running,说明上次进程是在这个任务执行到一半时没的
+            #(跑完了就会被报成 completed/failed)。不回收的话 tick 永远跳过它 —— 任务从此哑掉。
+            #放回 pending 等下一次到点,**不补跑崩掉的这次**:任务内容可能有副作用
+            #(发消息、改文件),宁可漏一次也不能重放。next_run 在 take_job 里已经推进过了,
+            #所以这里只改状态,tick 不会再把它当成"欠一次"立刻重跑
+            if job.status == JOB_RUNNING:
+                print(f"[scheduler] 任务 {job_id} 上次执行没有收尾(进程中断),放回待执行")
+                self._transition(job, JOB_PENDING)
             #旧版任务库没有 next_run 字段,从上次实际派发的时刻往后补算
             #(没派发过就从当前时刻算,同样只补一次 —— compute_next_run 只给一个点,
             # 推进发生在 take_job,所以堆积多久也不会变成一串补跑)
             if job.next_run is None:
                 job.next_run = job.compute_next_run(after=job.last_run or Job.bucket())
+            #还有后续触发却推不出时刻的,只可能是一次性任务:它被派发过(next_run 因此推成了
+            #None)却在执行中被打断。崩掉的那次不补跑,所以它到此为止 —— 说清楚,
+            #而不是留一条永远 pending 的任务让人猜。要再跑只能重新创建
+            if job.status == JOB_PENDING and job.next_run is None and job.once_at:
+                print(f"[scheduler] 任务 {job_id} 是一次性任务且时刻已过({job.once_at}),"
+                      f"不会再触发;要再执行请重新创建")
             self.jobs[job_id] = job
 
     #变更即存:把整个任务表写回文件(文件写入不可并发,调用方必须已持有 lock)
@@ -255,7 +271,7 @@ class Scheduler:
                 f"(当前状态只允许变为:{sorted(allowed) if allowed else '无,已是终态'})")
         job.status = status
 
-    #agent 取走一个到点的任务:出队、置为执行中(running)并推进下次时刻;队列空则返回 None
+    #派发器取走一个到点的任务:出队、置为执行中(running)并推进下次时刻;队列空则返回 None
     #时间指针在这里推进而不是在 tick:队列不落盘,派发后、取走前进程崩了,
     #next_run 仍是旧值,重启后再扫一次就自动补上 —— 「补跑」正是靠这一点成立的
     def take_job(self):
@@ -263,6 +279,7 @@ class Scheduler:
             if not self.queue:
                 return None
             job = self.queue.pop(0)
+            self.inflight[job.id] = job.next_run    #记下这次消耗的是哪个时刻,放回时要还回去
             self._transition(job, JOB_RUNNING)   # pending → running
             now_bucket = Job.bucket()
             job.last_run = now_bucket            #记的是实际派发时刻(补跑时即迟到的时刻)
@@ -270,22 +287,50 @@ class Scheduler:
             self._save()
             return job
 
-    #按任务id修改状态(工具入口):只准汇报执行结果;状态值越界或流转非法都抛 ValueError
-    def update_job_status(self, job_id: str, status: str) -> None:
-        if status not in JOB_REPORTABLE:    #先卡状态值,再进锁查库
-            raise ValueError(
-                f"status 只接受 {sorted(JOB_REPORTABLE)},收到 '{status}'。"
-                f"任务的下一次执行由调度器按 schedule 自动安排,不需要手动改回 pending。")
+    #汇报一次执行的结果:成功/失败写回状态,并清掉派发记录。
+    #调用方是派发器(JobDispatcher),**不是模型** —— 没有任何工具能改任务状态
+    #这个结果说的是「这一轮」,不是「任务结束了」:周期任务下一轮照常由 tick 重新入队
+    def report_done(self, job_id: str, ok: bool, output: str = "") -> None:
+        status = JOB_COMPLETED if ok else JOB_FAILED
         with self.lock:
+            self.inflight.pop(job_id, None)
             job = self.jobs.get(job_id)
             if job is None:
-                raise ValueError(f"任务 {job_id} 不存在")
+                #任务在跑的时候被删了(job_delete 允许删任何状态)。结果无处可写,
+                #但这不算错误:只是白跑了一轮,打一行日志留痕
+                print(f"[scheduler] 任务 {job_id} 已不存在(执行期间被删除),本轮结果丢弃")
+                return
             self._transition(job, status)
+            self._save()
+        #结果只打在这里:定时任务不进用户的对话(后台子agent 会发 <task_notification>,
+        #定时任务不发 —— 一个每分钟跑的任务会把对话刷爆)。要事后细查,看 job_list 的状态。
+        #成功也把结果带出来:任务跑在看不见的地方,这一行是它**唯一**的交付通道,
+        #只报"完成"而丢掉产出,用户没法知道它干了什么。
+        #压成一行:这段是打在用户的终端上的,多行输出会插进用户的输入提示符中间;
+        #要格式化的产出应该由任务自己写进文件(content 里就该这么要求)
+        mark = "完成" if ok else "失败"
+        flat = " ".join((output or "").split())
+        tail = f":{flat[:300]}" if flat else ""
+        print(f"[scheduler] 任务 {job_id} 执行{mark}{tail}")
+
+    #把任务原样放回待执行:派发器拿到名额之前被别处抢走了,这次派发没成
+    #next_run 要**还原成当初那个到点时刻**(从 inflight 里取),否则这次就白丢了 ——
+    #周期任务只是少跑一轮,一次性任务则因为 next_run 变成 None 而永远不会再触发。
+    #last_run 不回退:那次确实没跑成,留着它对调度没有影响(它只用于补算 next_run)
+    def requeue_job(self, job_id: str) -> None:
+        with self.lock:
+            due = self.inflight.pop(job_id, None)
+            job = self.jobs.get(job_id)
+            if job is None:     #和 report_done 一样容忍"任务没了":被删掉就没什么可放回的
+                print(f"[scheduler] 任务 {job_id} 已不存在(派发期间被删除),无需放回")
+                return
+            self._transition(job, JOB_PENDING)
+            if due is not None:
+                job.next_run = due
             self._save()
 
     #取消任务:置为 cancelled,不再被调度,记录保留(job_list 仍能看到,可 resume 恢复)
-    #执行中(running)的任务取消不了 —— agent 已经领走在跑了,拦不住;
-    #那种情况(含进程崩溃后卡在 running 的僵尸任务)用 delete_job 直接清掉
+    #执行中(running)的任务取消不了 —— 它已经在跑了,拦不住;等它跑完自己会报回 completed/failed
     def cancel_job(self, job_id: str) -> None:
         with self.lock:
             job = self.jobs.get(job_id)
@@ -298,7 +343,7 @@ class Scheduler:
     #恢复任务:把已取消的任务放回调度池(cancelled → pending),下次到点照常派发
     #只认已取消的任务 —— 其余状态要么本来就在调度里、要么正在跑,「恢复」无从谈起。
     #(流转表必须让 completed/failed → pending 合法,那是 tick 开新一轮用的内部边,
-    # 所以这里像 JOB_REPORTABLE 一样,由方法自己再卡一道「准不准从这条路走」)
+    # 所以这里由方法自己再卡一道「准不准从这条路走」)
     def resume_job(self, job_id: str) -> None:
         with self.lock:
             job = self.jobs.get(job_id)
@@ -316,15 +361,16 @@ class Scheduler:
             if job_id not in self.jobs:
                 raise ValueError(f"任务 {job_id} 不存在")
             del self.jobs[job_id]
+            self.inflight.pop(job_id, None)   #正在跑也要清:这条派发记录再没人来领了
             self._drop_from_queue(job_id)
             self._save()
 
-    #把任务从待领取队列里摘掉:取消/删除后必须做,否则 agent 仍会把它领走执行
-    #(job 早已派发进队列、只是还没被领走,状态仍是 pending,cancel 能成功但队列里还挂着)
+    #把任务从待领取队列里摘掉:取消/删除后必须做,否则派发器仍会把它领走执行
+    #(job 早已派发进队列、只是还没被取走,状态仍是 pending,cancel 能成功但队列里还挂着)
     def _drop_from_queue(self, job_id: str) -> None:
         self.queue = [j for j in self.queue if j.id != job_id]
 
-    #队列里是否还有待领取的任务(供 AgentRunner 轮询;持锁只读,不碰扫描逻辑)
+    #队列里是否还有待领取的任务(供派发器 JobDispatcher 轮询;持锁只读,不碰扫描逻辑)
     def has_pending(self) -> bool:
         with self.lock:
             return len(self.queue) > 0

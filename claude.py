@@ -13,7 +13,7 @@ from skill import  SkillLoader
 from compact import CompactManager
 from memory import MemoryManager
 from task import TaskStore,create_task_handlers
-from background import BackgroundManager
+from task_runner import TaskRunner, MAX_BACKGROUND_AGENTS
 from corn_job import Scheduler
 from message import Message, MessageBus
 from mcp import MCPManager
@@ -31,19 +31,47 @@ OFFLINE_MAX_ROUNDS = 2              #总共给几轮:第一轮可以重发,第�
 OFFLINE_REQ_TEXT = ("主agent判断当前不再需要你,请做最终确认:如果还有没做完的工作、"
                     "还在等别人回复,就拒绝下线;确认可以结束了就同意下线。")
 
+
+#把秒数说成人话。"已跑 3 分 12 秒"比"已跑 192.4 秒"更容易让人一眼看出是不是异常 ——
+#这个数字唯一的用处就是给"它卡住了没有"当参照,读起来费劲就等于没用
+def _fmt_elapsed(seconds):
+    total = int(seconds)
+    if total < 60:
+        return f"{total} 秒"
+    if total < 3600:
+        return f"{total // 60} 分 {total % 60} 秒"
+    return f"{total // 3600} 小时 {(total % 3600) // 60} 分"
+
+
 class ClaudeMini():
 
-    def __init__(self,show_thinking=False,slient = True,role=ROLE_MAIN,task_store=None,scheduler=None,message_bus=None,agent_name="main",agent_id=None,team_runtime=None,mcp=None):
+    def __init__(self,show_thinking=False,slient = True,role=ROLE_MAIN,task_store=None,scheduler=None,message_bus=None,agent_name="main",agent_id=None,team_runtime=None,mcp=None,task_runner=None,drains_results=None,deny_tools=None):
 
         self.skill_loader = SkillLoader()
         self.compact_mannager = CompactManager()
         self.memory_manager = MemoryManager()
-        self.background_manager = BackgroundManager()
+
+        #后台执行器:和 Scheduler / TaskStore / MCP 一样是**共享服务**。
+        #结果邮箱必须是同一个 —— 谁自己建一个,它提交的后台任务结果就会落进那份
+        #没人读的邮箱,永远送不回主对话。所以子agent也共享同一个实例(见 _build_subagent)
+        self.task_runner = task_runner if task_runner is not None else TaskRunner()
+
+        #谁是这份邮箱的收件人。两种情况:
+        #① 邮箱是自己建的(没传 task_runner)——自己就是唯一的读者,直接收。
+        #   团队成员走这条:它有自己的 runner,run_forever 里照常收自己提交的后台任务。
+        #② 邮箱是别人给的 —— 默认**不收**,必须显式说明。给的情况有两种:
+        #   a. 共用的(子agent共享主agent那份):收了就会抢,绝不该收(见 _build_subagent);
+        #   b. 专给一个人的(定时任务agent拿到的那份):它是唯一读者,该收 —— 传 True。
+        #   两种从参数上看不出来,所以默认选"不收":忘了标只是少一条通知,标错了是通知跑到别人家去
+        self.drains_results = (task_runner is None) if drains_results is None else drains_results
 
         #身份:决定这个 agent 拥有哪些工具(表在 TOOLS.py 的 ROLE_DENIED)。
         #角色管的是"这个身份有没有这个工具",和"这次调用的参数允不允许"(PERMISSIONS)是两回事
         self.role = role
-        self.denied_tools = set(ROLE_DENIED[role])
+        #deny_tools 是调用方追加的禁用名单,叠在角色之上。
+        #给的是**名字集合**不是角色(和 tool_filter 同一个约定):禁的理由不一定来自身份,
+        #比如定时任务agent —— 身份是 ROLE_MAIN,但它不拥有一棵长命的树,团队工具对它没意义
+        self.denied_tools = set(ROLE_DENIED[role]) | set(deny_tools or ())
 
         #注册表也提前到这里:下面要往里注册 MCP 工具,而 self.llm 又得先拿到 self.tools
         self.tool_registry = create_default_registry()
@@ -136,6 +164,7 @@ class ClaudeMini():
         #(mcp.py 里那条不变量:注册了没进 schema、进了 schema 没注册,都是 bug)
         native_handlers = {
             "subagent": self.run_subagent,
+            "bg_status": self.bg_status,
             "load_skill": self.skill_loader.load,
             "recall_memory": self.recall_memory,
             **self.memory_manager.create_handlers(),
@@ -163,7 +192,8 @@ class ClaudeMini():
         
         while True:
             #收集后台任务执行结果
-            results = self.background_manager.collect()
+            #收集后台任务执行结果。**只有收件人本人能领**,见 __init__ 的 drains_results
+            results = self.task_runner.collect() if self.drains_results else {}
             notification = self.build_task_notifications(results)
             if notification:
                 history.append(notification)
@@ -214,13 +244,14 @@ class ClaudeMini():
                 if block.type == "tool_use":
                     tool_calls.append(block)
 
-            #没有工具调用需求退出循环   
+            #没有工具调用需求退出循环
             if not tool_calls:
-                #等待后台任务完成
-                if self.background_manager.has_background_tasks():
-                    if self.background_manager.wait_background_tasks(timeout=300):
-                        continue
-                    return last_text
+                #后台任务**不在这里等**
+                #原来这里是 wait_background_tasks(timeout=300):模型停手后阻塞等后台跑完,
+                #再 continue 把结果收进来。那是"同一轮内并发" —— 好处是结果当场就报给用户,
+                #代价是这一轮最长被占住 300s,而且超时就再也收不到(要等下一次 run())。
+                #现在改成真异步:立刻返回,后台跑完了由 main.py 的 user_loop 唤醒,
+                #在**新一轮**的开头被 collect() 领走,包成 <task_notification> 进对话
                 return last_text  #返回子agent最后一轮执行结果(最后一轮无正文则退回上一轮)
             
             #调用本轮工具
@@ -736,8 +767,32 @@ class ClaudeMini():
                 return
             self._handle_control(msg)
 
-    #子agent
-    def run_subagent(self, prompt: str):
+    #子agent的实例工厂:前台(run_subagent)和后台(run_subagent_background)共用一份。
+    #抽出来是因为下面那段注释是**承重的** —— 复制两份迟早会漂移,而这个类最怕的
+    #就是"某条路径悄悄多注入了一个共享服务"
+    def _build_subagent(self, agent_name="main"):
+        #子agent:身份是 subagent,天然没有"起子agent/写记忆/recall_memory/定时任务/团队"这些工具。
+        #**不注入总线** —— 它是一次性的、没有信箱:真让它共享总线,它 run() 里的
+        #collect_team_messages 就会去 drain 主agent的收件箱,把主人的消息抢走。
+        #反过来说,task_runner **必须**共享:它是**结果邮箱**,谁自建一个,谁提交的后台任务
+        #跑完就落进没人读的邮箱(主agent提交后台任务时也共享,理由一样)。
+        #邮箱共享了,领取者就唯一 —— 由 drains_results 挡住,子agent 不领(见 __init__)。
+        #scheduler 同样必须共享同一实例(锁与扫描线程不可复制)
+        return ClaudeMini(slient=False, role=ROLE_SUBAGENT,
+                          task_store=self.task_store,
+                          scheduler=self.scheduler,
+                          task_runner=self.task_runner,
+                          drains_results=False,
+                          mcp=self.mcp,
+                          agent_name=agent_name)
+
+    #子agent(前台):**阻塞**在调用线程上跑,跑完当场把结果当工具结果返回
+    #
+    #**_ignored 必须留着:schema 里还有 is_background,模型把它显式写成 false 时
+    #它会一起出现在 block.input 里,一路传到 handler(**input) —— 签名里不接住就是
+    #TypeError(报错还会说"参数有误",把模型带偏)。true 的那条在 excute_tool 的后台
+    #分支就分流掉了,根本走不到这。run_bash 用的是同一个写法
+    def run_subagent(self, prompt: str, **_ignored):
         """启动一个独立子agent执行指定任务"""
         #只有主agent能起子agent。别的角色在工具层已经拦住了(看不到 subagent),
         #这里必须再拦一道,因为 recall_memory 会**直接内部调用**本方法 ——
@@ -747,20 +802,13 @@ class ClaudeMini():
 
         HOOKS.trigger_hooks("BefSubAgent",prompt)
 
-        subagent_prompt = SUBAGENT_PROMPT + "\n" + prompt
-
-        #子agent:身份是 subagent,天然没有"起子agent/写记忆/recall_memory/定时任务/团队"这些工具。
-        #**不注入总线** —— 它是一次性的、没有信箱,而且没传 agent_name 时它的 agent_id 就是 "main":
-        #真让它共享总线,它 run() 里的 collect_team_messages 就会去 drain 主agent的收件箱,把主人的消息抢走。
-        #scheduler 必须共享同一实例(锁与扫描线程不可复制)
-        subagent = ClaudeMini(slient=False, role=ROLE_SUBAGENT,
-                              task_store=self.task_store,
-                              scheduler=self.scheduler, mcp=self.mcp)
+        #子agent的 agent_name 保持默认 "main"(和以前一样)
+        subagent = self._build_subagent()
 
         history = [
             {
                 "role": "user",
-                "content": subagent_prompt
+                "content": SUBAGENT_PROMPT + "\n" + prompt
             }
         ]
 
@@ -769,6 +817,94 @@ class ClaudeMini():
         HOOKS.trigger_hooks("AftSubAgent",result)
 
         return result
+
+    #子agent(后台):建一个全新实例丢给 TaskRunner,立刻返回 task_id
+    #
+    #和 run_subagent 的关系:共用"子agent是什么"(工厂、SUBAGENT_PROMPT、注入哪些共享服务),
+    #不同的是**怎么跑** —— 执行体交给 TaskRunner 在自己的线程里跑,调用方(主agent这一轮)
+    #立刻拿到一句"已提交"就继续干活,结果跑完由 <task_notification> 送回主对话
+    def run_subagent_background(self, prompt: str):
+        """起一个后台子agent执行任务:立刻返回,结果稍后由 <task_notification> 送回"""
+        #和 run_subagent 同样的理由:角色检查必须在方法里再拦一道,
+        #因为 recall_memory 会绕过 excute_tool 直接调进来
+        if self.role != ROLE_MAIN:
+            return "❌ 只有主agent能起子agent。自己做,或把需求带回父agent。"
+
+        #work 是个闭包,在 TaskRunner 的线程里执行 —— 捕获的 self 是主agent,
+        #只用到它的共享服务(task_store/scheduler/task_runner/mcp),不碰它的历史
+        task_id = self.task_runner.submit_agent(
+            lambda tid: self._run_background_subagent(tid, prompt))
+
+        if task_id is None:
+            #满了必须**说出来**。静默丢弃的话模型以为已经跑上了,永远不会去补那个任务
+            return (f"❌ 后台子agent 已达并发上限({MAX_BACKGROUND_AGENTS} 个在跑),这条没有提交。"
+                    f"等前面的跑完再试,或者改用前台 subagent 直接做。")
+
+        return f"🔄 子agent {task_id} 已在后台执行,跑完我会收到结果。"
+
+    #后台子agent的执行体 —— **跑在 TaskRunner 的线程里,不是主线程**。
+    #两件事因此而不一样,都不是 bug:
+    #① 问不了人:permission_hook 靠"是不是主线程"判断能否弹窗问用户(HOOKS.py:45),
+    #   这条线程上所有 ASK 类操作(写 memory/、覆盖已有文件…)一律被拒。这是决策:
+    #   后台任务没人守着屏幕,不该挂在那里等一个可能已经走开的用户。
+    #② 打印会和用户输入交错(hook 的 banner 是从这条线程打出去的)。
+    #   子agent本体是 slient=False,不会刷模型的正文,只有 banner 会串行;
+    #   省掉 hook 是更坏的选择 —— 那等于这个子agent在观测面上根本不存在。
+    def _run_background_subagent(self, task_id, prompt):
+        HOOKS.trigger_hooks("BefSubAgent", prompt)
+
+        #agent_name 用 task_id:进程里可能同时有好几个后台子agent,名字是事后对账用的
+        #(banner、异常栈、提交时回给模型的那句 "子agent bg_0002 已在后台执行" 指的是同一个)
+        subagent = self._build_subagent(agent_name=task_id)
+
+        history = [
+            {
+                "role": "user",
+                "content": SUBAGENT_PROMPT + "\n" + prompt
+            }
+        ]
+
+        result = subagent.run(history)
+
+        HOOKS.trigger_hooks("AftSubAgent", result)
+
+        return result
+
+    #后台任务查询(工具 bg_status):让模型能自己问一句「我起的那些后台任务怎么样了」。
+    #
+    #它补的是看门狗够不着的那一半。看门狗只认"线程没了"(_finalize 那条路压根没走到),
+    #而"线程还活着、但一直不返回"在进程内**没有任何办法自动发现**:Python 杀不掉线程,
+    #也就没人能替它下结论(LLM 调用没超时,一次网络卡顿就能让一个后台 agent 僵住十分钟)。
+    #能做的就是把可观测的东西如实报出来,让模型自己判断要不要放弃它
+    def bg_status(self):
+        #先补账、再报数。顺序不能反:先报数的话,一条线程早就没了的任务会被报成
+        #"正在跑",而下一秒主循环又收到它的失败通知 —— 同一件事两个说法。
+        #反过来先 reap,报出来的就一定是"已经发生过的事",和通知对得上
+        reaped = self.task_runner.reap_dead()
+        snap = self.task_runner.snapshot()
+
+        running = snap["running"]
+        used, cap = snap["agents_running"], snap["max_agents"]
+
+        lines = []
+        if reaped:
+            lines.append(f"⚠️ 有 {len(reaped)} 条后台任务的线程已经终止、没留下结果,"
+                         f"已按失败记录,稍后会收到 <task_notification>:{'、'.join(reaped)}")
+        if not running:
+            #空了也要报,而且要把名额一起报:模型问这个常常是为了"还能不能再交一个",
+            #而"没有在跑的任务"本身已经回答了它
+            lines.append(f"当前没有正在跑的后台任务。后台子agent 还能再交 {cap} 个。")
+        else:
+            #名额只卡 agent,bash 不受它限制 —— 所以要按 kind 分开说。
+            #含混地说"还能再交 N 个",模型会以为那是总数,于是不敢交 bash(或反过来,
+            #以为交 bash 也会被拒而白改方案)
+            lines.append(f"后台子agent {used}/{cap} 在跑(还能再交 {max(cap - used, 0)} 个;"
+                         f"后台 bash 命令不受这个上限限制):")
+            #按已跑时长从长到短:最可能卡住的那条排在最上面,不用往下找
+            for t in sorted(running, key=lambda t: -t["elapsed"]):
+                label = "子agent" if t["kind"] == "agent" else "bash命令"
+                lines.append(f"- {t['task_id']} {label} 已跑 {_fmt_elapsed(t['elapsed'])}")
+        return "\n".join(lines)
 
     #记忆召回
     def recall_memory(self, query: str = None) -> str:
@@ -804,21 +940,26 @@ class ClaudeMini():
 
         #PreToolUse 必须在**下面每一条分支之前**过一遍。原来"后台 bash"那条分支在它上面
         #直接 return,等于后台命令完全不做权限检查 —— 加个 is_background=True,
-        #"rm -rf /" 就把 DENY 表绕过去了(background.py 自己也不调 hook,它拿到 command
+        #"rm -rf /" 就把 DENY 表绕过去了(task_runner.py 自己也不调 hook,它拿到 command
         #就直接 execute_bash)。
-        #也**不能**改成"挪进 BackgroundManager 的线程里再过":permission_hook 是靠
-        #"是不是主线程"来决定能不能弹窗问用户的(HOOKS.py:36),在后台线程里问,
-        #主agent自己那条正常命令也会被当成"成员弹不了窗"直接拒掉。
+        #也**不能**改成"挪进 TaskRunner 的线程里再过":permission_hook 是靠
+        #"是不是主线程"来决定能不能弹窗问用户的(HOOKS.py:45),在后台线程里问,
+        #主agent自己那条正常命令也会被当成"后台线程弹不了窗"直接拒掉。
         #结论:权限判定属于**发起调用的线程**,所以必须在这里做。
         hook_result = HOOKS.trigger_hooks("PreToolUse", block)
         if hook_result is not None:
             print(f"Hook result: {hook_result}")
             return hook_result
 
-        if block.input.get("is_background") and block.name == "bash":
-            # 后台执行工具
-            task_id = self.background_manager.start(block)
-            return f"🔄 工具 {task_id} 已在后台执行。"
+        #后台执行:同一个"后台"策略,按工具选执行体。
+        #schema 里长着 is_background 的工具才可能走到这里(bash / subagent),
+        #所以这里的名字判断是**白名单**,不是"谁都能后台跑"
+        if block.input.get("is_background"):
+            if block.name == "bash":
+                task_id = self.task_runner.submit_bash(block.input.get("command"))
+                return f"🔄 工具 {task_id} 已在后台执行。"
+            if block.name == "subagent":
+                return self.run_subagent_background(block.input.get("prompt"))
 
         #获取工具处理函数
         handler = self.tool_registry.get(block.name)
@@ -877,20 +1018,26 @@ class ClaudeMini():
                     f"{k}(必填)" if k in required else k for k in props) or "(无参数)"
         return "(未知工具)"
 
-    #结构化后台任务消息                      
+    #结构化后台任务消息
+    #kind/status 都要报:模型看到"子agent 已失败"才会去补救,只报"已完成"它会当成成功
     def build_task_notifications(self, results):
         if not results:
             return None
 
+        KIND_LABEL = {"bash": "bash命令", "agent": "子agent"}
+        STATUS_LABEL = {"completed": "已完成", "failed": "已失败"}
+
         notifications = []
 
-        for task_id, output in results.items():
+        for task_id, record in results.items():
+            kind = KIND_LABEL.get(record["kind"], record["kind"])
+            status = STATUS_LABEL.get(record["status"], record["status"])
             notifications.append({
                 "type": "text",
                 "text": (
                     f"<task_notification>\n"
-                    f"后台任务 {task_id} 已完成。\n"
-                    f"输出：\n{output}\n"
+                    f"后台{kind} {task_id} {status}。\n"
+                    f"输出：\n{record['output']}\n"
                     f"</task_notification>"
                 )
             })
@@ -945,19 +1092,11 @@ class ClaudeMini():
         except ValueError as e:
             return str(e)
 
-    def job_take(self):
-        job = self.scheduler.take_job()     #出队并置为 running
-        if job is None:
-            return "暂无待执行任务。"
-        return (f"已取出定时任务 {job.id}(状态 running)。\n"
-                f"执行内容:{job.content}\n"
-                f"执行完成后请调用 job_update_status,把 {job.id} 置为 completed 或 failed。")
-
-    def job_update_status(self, job_id, status):
-        try:
-            self.scheduler.update_job_status(job_id, status)
-            return f"任务 {job_id} 状态已更新为 {status}"
-        except ValueError as e:
-            return str(e)
+    #注:这里**没有** job_take / job_update_status。
+    #到点的任务由派发器(dispatcher.JobDispatcher)自动取走并在独立的后台 agent 里跑,
+    #跑完由派发器把结果汇报回 Scheduler —— 全程不需要模型参与。
+    #这两个工具在"模型自己领任务"的旧设计里是必需的,现在不但多余,还有害:
+    #模型一旦领走一条就会把它置成 running,而那条任务正在后台跑,状态被搅乱。
+    #详见 PROMPT.py 的「定时任务」一节
 
     
