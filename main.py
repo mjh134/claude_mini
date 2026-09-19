@@ -5,7 +5,6 @@ import HOOKS
 from claude import ClaudeMini
 from agent_runner import AgentRunner
 import skill
-from message import MessageBus
 
 
 
@@ -53,8 +52,9 @@ def user_loop(history,claude_mini:ClaudeMini):
 
 if __name__ == "__main__":
 
-    #初始化agent(接入消息总线,这样它才能组建 agent 团队;不接就是原来的单agent模式)
-    claude_mini = ClaudeMini(show_thinking=True, message_bus=MessageBus(), agent_name="main")
+    #初始化agent。消息总线、任务库、调度器、MCP 都由构造函数自己备好,
+    #调用方不需要知道有这些东西(要用同一个实例时才显式传,比如 team_spawn 给成员注入总线和成员表)
+    claude_mini = ClaudeMini(show_thinking=True, agent_name="main")
 
     #加载狗子
     HOOKS.register_hook("PreToolUse", HOOKS.permission_hook)

@@ -11,6 +11,10 @@ class BackgroundManager:
         self.lock = threading.Lock()
 
     #启动后台任务
+    #权限检查(PreToolUse)**不在这里做**,是在 excute_tool 的调用线程里、进到这条分支之前就做完了。
+    #别"顺手补上"一个 trigger_hooks:permission_hook 靠"是不是主线程"决定能不能弹窗问用户,
+    #而这里开的是另一条线程 —— 在这儿过一遍,主agent自己的正常命令也会被当成
+    #"成员弹不了窗"直接拒掉。
     def start(self,block):
         command = block.input.get("command")
         with self.lock:

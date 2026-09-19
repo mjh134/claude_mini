@@ -1,7 +1,9 @@
 from datetime import datetime
 import threading
 from llm import LLM
-from TOOLS import Tools,create_default_registry
+from TOOLS import (Tools, create_default_registry, tool_filter, check_roles,
+                   ROLE_MAIN, ROLE_SUBAGENT, ROLE_MEMBER, ROLE_DENIED, ROLE_HINT,
+                   JOB_TOOLS)
 import HOOKS
 from PROMPT import SYSTEM_PROMPT
 from PROMPT import SUBAGENT_PROMPT
@@ -13,7 +15,7 @@ from memory import MemoryManager
 from task import TaskStore,create_task_handlers
 from background import BackgroundManager
 from corn_job import Scheduler
-from message import Message
+from message import Message, MessageBus
 from mcp import MCPManager
 from team import (TeamRuntime, KIND_CHAT, KIND_OFFLINE_REQ, KIND_OFFLINE_AGREE,
                   KIND_OFFLINE_REFUSE, ALIVE, EXITING, OFFLINE, DEAD,
@@ -31,18 +33,17 @@ OFFLINE_REQ_TEXT = ("主agent判断当前不再需要你,请做最终确认:如�
 
 class ClaudeMini():
 
-    def __init__(self,show_thinking=False,slient = True,allow_recall_memory=True,allow_subagent=True,allow_write_memory=True,task_store=None,scheduler=None,allow_jobs=True,message_bus=None,agent_name="main",allow_team=True,agent_id=None,team_runtime=None,mcp=None):
+    def __init__(self,show_thinking=False,slient = True,role=ROLE_MAIN,task_store=None,scheduler=None,message_bus=None,agent_name="main",agent_id=None,team_runtime=None,mcp=None):
 
         self.skill_loader = SkillLoader()
         self.compact_mannager = CompactManager()
         self.memory_manager = MemoryManager()
         self.background_manager = BackgroundManager()
 
-        #工具表必须**新建一个列表**,不能像原来那样直接 self.tools = Tools:
-        #Tools 是 TOOLS.py 里的模块级列表,所有 agent 共用同一个对象。
-        #就地 += 把 MCP 工具追加上去,加的是那个全局列表 —— 之后每建一个 agent
-        #(每个子agent、每个团队成员)就再追加一遍,同一个工具名在 schema 里出现多次。
-        self.tools = list(Tools)
+        #身份:决定这个 agent 拥有哪些工具(表在 TOOLS.py 的 ROLE_DENIED)。
+        #角色管的是"这个身份有没有这个工具",和"这次调用的参数允不允许"(PERMISSIONS)是两回事
+        self.role = role
+        self.denied_tools = set(ROLE_DENIED[role])
 
         #注册表也提前到这里:下面要往里注册 MCP 工具,而 self.llm 又得先拿到 self.tools
         self.tool_registry = create_default_registry()
@@ -51,7 +52,24 @@ class ClaudeMini():
         #和 Scheduler / TaskStore 一样,整个 agent 树**共享同一个实例** ——
         #每个 server 背后是一个子进程加一条读线程,这两样都复制不了(见 mcp.MCPManager)
         self.mcp = mcp if mcp is not None else MCPManager()
-        self.tools += self._register_mcp_tools()
+
+        #工具表的两个来源**先合并、再统一过滤一次**。顺序不能反:
+        #只滤 Tools 的话,MCP 那批是后追加的,会整批绕过过滤。
+        #Tools 是 TOOLS.py 里的模块级列表,所有 agent 共用同一个对象 ——
+        #list() 出新列表,绝不能就地改它(以前 MCP 那批就地 += 污染了全局列表:
+        #每建一个 agent 就再追加一遍,同一个工具名在 schema 里出现多次)
+        schemas = list(Tools) + self._register_mcp_tools()
+        self.tools = tool_filter(schemas, self.denied_tools)
+
+        #运行时那道保险用的集合:模型看得见什么,就只允许调什么。
+        #它和 self.tools 同源,所以防的是"绕过构造函数的调用路径",不是"两处配置漂移"
+        self.allowed_tools = {t["name"] for t in self.tools}
+
+        #角色表里写了不存在的工具名(拼错)只会静默失效:不报错,也不禁任何东西。
+        #只在主agent上对一次 —— 它是启动时唯一确定会被建出来的实例,没必要每个成员都刷一遍
+        if role == ROLE_MAIN:
+            for problem in check_roles(t["name"] for t in schemas):
+                print(f"[role] ⚠️ {problem}")
 
         # 加载长期记忆并注入 system prompt
         session_memory = self.memory_manager.load_session_memory()
@@ -66,57 +84,41 @@ class ClaudeMini():
             self.system_prompt = SYSTEM_PROMPT + "\n" + current_time + "\n" + "你可以使用以下skill解决相关问题:\n" + self.skill_loader.catalog()
 
         #团队成员看到的规则和主agent不同(不能建团队、不能自己退出、要如实做下线确认),
-        #不清不楚会让它照主agent的说明去"组建团队"甚至谎报结果(测试报告·问题6)
-        if message_bus is not None and not allow_team:
+        #不清不楚会让它照主agent的说明去"组建团队"甚至谎报结果(测试报告·问题6)。
+        #这里用的是**同一个 role** —— 以前"给哪段提示词"和"给哪些工具"是两套并行机制,
+        #各写各的、会互相漂移;现在合成一套
+        if role == ROLE_MEMBER:
             self.system_prompt += "\n" + TEAM_MEMBER_PROMPT
 
         self.llm = LLM(self.system_prompt,self.tools)
 
-        self.tool_registry.register("subagent",self.run_subagent)
-        self.tool_registry.register("load_skill",self.skill_loader.load)
-        self.tool_registry.register("recall_memory",self.recall_memory)
-
         self.show_thinking = show_thinking   #是否展示思考
         self.slient = slient        #是否展示子agent消息
-        self.allow_recall_memory = allow_recall_memory #是否允许调用 recall_memory(子agent默认False防递归)
-        self.allow_subagent = allow_subagent       #是否允许(再)启动子agent(子agent默认False防递归)
-        self.allow_write_memory = allow_write_memory #是否允许写入长期记忆(子agent默认False防污染共享库)
-
-        # 注册 memory 工具;禁用的工具注册守卫桩,给出指引而非裸报错
-        for name, handler in self.memory_manager.create_handlers().items():
-            if getattr(self, "allow_" + name, True):
-                self.tool_registry.register(name, handler)
-            else:
-                self.tool_registry.register(name, self._memory_guard(name))
 
         # 任务系统:库文件落在当前目录 .task/tasks.json(跨会话保留);主/子agent共享同一 store
         self.task_store = task_store if task_store is not None else TaskStore(".task/tasks.json")
-        for name, handler in create_task_handlers(self.task_store).items():
-            self.tool_registry.register(name, handler)
 
         # 定时任务:库文件落在当前目录 .task/jobs.json(跨会话保留)
         # 扫描线程与锁都不可复制,主/子agent必须共享同一个 scheduler 实例 ——
         # 否则会各起一条扫描线程、各持一把锁去写同一个文件,导致文件交错写坏
         self.scheduler = scheduler if scheduler is not None else Scheduler(".task/jobs.json")
-        self.allow_jobs = allow_jobs    #是否允许领取定时任务(子agent默认False,由主agent统一执行)
         self.scheduler.start()          #重复调用是 no-op,共享实例时子agent不会起第二条线程
 
-        # 注册定时任务的七个工具(Schema 在 TOOLS.py,实现在下面的 job_* 方法)
-        # 子agent不碰定时任务:注册守卫桩,给出指引而非裸报错
-        for name in ("job_create", "job_list", "job_cancel", "job_resume",
-                     "job_delete", "job_take", "job_update_status"):
-            if self.allow_jobs:
-                self.tool_registry.register(name, getattr(self, name))
-            else:
-                self.tool_registry.register(name, self._job_guard(name))
-
-        # agent_teams:接入消息总线才有团队身份(message_bus=None 即原来的单agent模式,行为不变)
-        self.message_bus = message_bus
+        # 消息总线:和 Scheduler / TaskStore / MCP 一样,整个 agent 树共享同一条 ——
+        # 每个成员背后是一条线程,大家靠同一条总线互相寻址,各建各的就谁也找不到谁。
+        # 默认自己建一条,调用方(main.py)不需要知道有这东西;
+        # 成员由 team_spawn 注入主agent那一条,子agent**不**注入(见 run_subagent)
+        self.message_bus = message_bus if message_bus is not None else MessageBus()
         self.agent_name = agent_name
         #通信身份是 ID,不是名字:名字可以重复(只用于展示/日志/模型理解),
         #ID 唯一且成员下线后不回收(设计.md 三)
         self.agent_id = agent_id or agent_name
-        self.allow_team = allow_team    #是否允许创建/管理团队成员(成员默认False,防无限扩张)
+
+        #成员管理归 TeamRuntime(由主agent持有),MessageBus 只管收发(设计.md 五)
+        self.team_runtime = team_runtime
+        if role == ROLE_MAIN and self.team_runtime is None:
+            self.team_runtime = TeamRuntime(owner_id=self.agent_id)
+
         self.running = False        # run_forever 的生命周期开关(确认下线时才置 False)
         self.state = "idle"         # idle / work / exit,成员自己报的执行状态(仅供展示)
         self._team_history = []     # 团队对话历史(跨消息保留)
@@ -127,24 +129,27 @@ class ClaudeMini():
         #存绝对时刻而不是倒计时:检查来晚了(主agent正卡在一次长工具调用里)也不会把窗口越推越长
         self._offline_watch = {}
 
-        #成员管理归 TeamRuntime(由主agent持有),MessageBus 只管收发(设计.md 五)
-        self.team_runtime = team_runtime
-        if self.message_bus is not None:
-            # 只有团队模式才注册这些工具,单agent模式下模型看不到
-            self.tool_registry.register("send_message", self.send_message)
-            if self.allow_team:
-                if self.team_runtime is None:
-                    self.team_runtime = TeamRuntime(owner_id=self.agent_id)
-                self.tool_registry.register("team_spawn", self.team_spawn)
-                self.tool_registry.register("team_list", self.team_list)
-                self.tool_registry.register("team_stop", self.team_stop)
-            else:
-                #成员只能读成员表;创建/下线成员的写权限属于主agent(设计.md 十一)。
-                #禁用工具注册守卫桩,给指引而不是裸报错(也减少模型"谎报已组建团队")
-                self.tool_registry.register("team_list", self.team_list)
-                self.tool_registry.register("team_offline_confirm", self.team_offline_confirm)
-                self.tool_registry.register("team_spawn", self._team_guard("team_spawn"))
-                self.tool_registry.register("team_stop", self._team_guard("team_stop"))
+        #原生工具的处理函数:先集中成一张表,再按身份**一次性**注册。
+        #以前这里是每个工具组一个 if/else,禁用时注册一个"守卫桩"返回提示语;
+        #现在桩没了 —— 被禁的工具干脆不存在:模型看不到(不在 self.tools),
+        #运行时也调不动(不在 registry)。两处用的是同一个 denied_tools,不可能对不上
+        #(mcp.py 里那条不变量:注册了没进 schema、进了 schema 没注册,都是 bug)
+        native_handlers = {
+            "subagent": self.run_subagent,
+            "load_skill": self.skill_loader.load,
+            "recall_memory": self.recall_memory,
+            **self.memory_manager.create_handlers(),
+            **create_task_handlers(self.task_store),
+            **{name: getattr(self, name) for name in JOB_TOOLS},
+            "send_message": self.send_message,
+            "team_spawn": self.team_spawn,
+            "team_list": self.team_list,
+            "team_stop": self.team_stop,
+            "team_offline_confirm": self.team_offline_confirm,
+        }
+        for name, handler in native_handlers.items():
+            if name not in self.denied_tools:
+                self.tool_registry.register(name, handler)
 
 
     #agent循环
@@ -248,8 +253,10 @@ class ClaudeMini():
     # 成员的生命周期:idle(真阻塞) → work → idle ... 直到主agent请求下线并完成最终确认
     def run_forever(self):
 
-        if self.message_bus is None:
-            raise RuntimeError("未接入 MessageBus,无法进入团队模式(构造时传 message_bus=...)")
+        #常驻循环是**团队成员**的存在方式:要有成员表才知道自己归谁管、跟谁协作。
+        #总线不用查 —— 它现在由构造函数自己建,不可能是 None
+        if self.team_runtime is None:
+            raise RuntimeError("没有成员表,这个 agent 不是团队的一员,不能跑常驻循环")
 
         self.running = True
         self._team_history = team_history = []   # 跨消息保留:agent 记得和同事聊过什么
@@ -302,8 +309,6 @@ class ClaudeMini():
         发之前先确认收件人属于当前团队 —— 不存在/已下线的成员直接拒绝,
         不能让消息留在总线上等着被"未来某个 agent"错误消费(设计.md 七)
         """
-        if self.message_bus is None:
-            return "❌ 当前未接入消息总线,无法发送消息。"
         if not (content or "").strip():
             return "❌ 消息内容为空。"
         runtime = self.team_runtime
@@ -337,7 +342,8 @@ class ClaudeMini():
         - 团队通知(成员上下线)→ 拼成 <team_notice> 块,让模型知道团队发生了什么
         多条消息会合并成一条 user 消息(队友与主agent走同一条路径,语义一致)
         """
-        if self.message_bus is None:
+        #不属于任何团队(子agent)就没有团队消息可言:它有自己的空总线,别去 drain
+        if self.team_runtime is None:
             return None
         blocks = []
         for msg in self.message_bus.drain(self.agent_id):
@@ -368,7 +374,7 @@ class ClaudeMini():
         但"成员失灵"这类通知必须专门叫一趟 —— 那时候往往没有别人再发消息了,
         只搭车就等于永远送不到(压测里主agent 就是这样静默停住的)
         """
-        if self.message_bus is None:
+        if self.team_runtime is None:
             return False
         #带 wake 的通知必须专门叫一趟:成员出问题时往往没有别人再发消息,搭车就等于永远送不到
         if any(urgent for _text, urgent in self._notices):
@@ -381,10 +387,6 @@ class ClaudeMini():
         成员干完当前的活不会自动退出:它回到 idle 继续等消息(设计.md 二·1)。
         真正让它下线的是 team_stop(主agent发起 → 成员最终确认)。
         """
-        if self.message_bus is None:
-            return "❌ 未接入消息总线,无法组建团队。"
-        if not self.allow_team:
-            return "❌ 团队成员不能再创建团队(避免无限扩张)。请自己完成,或把需求带回主agent。"
         name = (name or "").strip()
         if not name:
             return "❌ 成员名字不能为空。"
@@ -395,11 +397,9 @@ class ClaudeMini():
         #重名是允许的:身份是 ID,名字只用于展示和模型理解(设计.md 三·name)
         member = runtime.register(name=name, task=prompt)
 
-        #成员:禁再建团队/子agent、禁写记忆、禁领定时任务;共享任务库与调度器实例
-        teammate = ClaudeMini(slient=True, show_thinking=False, allow_team=False,
-                              allow_subagent=False, allow_write_memory=False,
-                              allow_recall_memory=False, allow_jobs=False,
-                              agent_name=name, agent_id=member.id,
+        #成员:身份是 team_member,所以它天然没有"建团队/起子agent/写记忆/领定时任务"这些工具
+        #(表在 TOOLS.ROLE_DENIED);共享总线、成员表、任务库、调度器、MCP
+        teammate = ClaudeMini(role=ROLE_MEMBER, agent_name=name, agent_id=member.id,
                               message_bus=self.message_bus, team_runtime=runtime,
                               task_store=self.task_store, scheduler=self.scheduler,
                               mcp=self.mcp)
@@ -433,9 +433,9 @@ class ClaudeMini():
         这里只是"发出下线意图":逻辑状态置为 exiting,绝不假定它已经死了 ——
         要等它确认、并且线程确实停了,才由 _on_offline_reply 置为 offline。
         """
-        if self.message_bus is None:
-            return "❌ 未接入消息总线,没有团队可管。"
         runtime = self.team_runtime
+        if runtime is None:
+            return "❌ 当前没有成员表,没有团队可管。"
         target, err = runtime.resolve_member(member)
         if err:
             return err
@@ -466,8 +466,6 @@ class ClaudeMini():
 
     def team_offline_confirm(self, agree: bool, reason: str = "") -> str:
         """成员对主agent下线请求的最终确认(只有成员能看到这个工具)"""
-        if self.allow_team:
-            return "❌ 这个工具只对团队成员有意义。"
         self._offline_decision = (bool(agree), (reason or "").strip())
         if agree:
             return "✅ 已确认下线:你的线程会在这一轮结束后停止,之后不再收到消息。"
@@ -479,7 +477,7 @@ class ClaudeMini():
 
     def process_control_messages(self) -> int:
         """只处理控制面消息,不叫模型 —— 用户没输入时,主循环靠它推进下线握手"""
-        if self.message_bus is None:
+        if self.team_runtime is None:
             return 0
         handled = 0
         for msg in self.message_bus.drain(self.agent_id, is_control):
@@ -688,7 +686,7 @@ class ClaudeMini():
         万一它只是慢,稍后补上回信,状态会被自动纠正。
         """
         self.team_runtime.update(member.id, status=DEAD, note="下线请求超时无回应")
-        left = self.message_bus.drain(member.id) if self.message_bus else []
+        left = self.message_bus.drain(member.id)
         self._notice(
             f"成员 {member.id}({member.name}) 等满 {OFFLINE_ACK_TIMEOUT_SECONDS * OFFLINE_MAX_ROUNDS} 秒"
             f"仍未回应下线请求(最后自报状态 {member.self_state},"
@@ -713,12 +711,11 @@ class ClaudeMini():
 
         #按协议下线的成员是"先发确认消息、再停线程",所以在消息被取走之前,
         #它和异常死亡长得一模一样 —— 先取消息,再对账,顺序不能反。
-        if self.message_bus is not None:
-            for msg in self.message_bus.drain(self.agent_id, is_control):
-                self._handle_control(msg)
+        for msg in self.message_bus.drain(self.agent_id, is_control):
+            self._handle_control(msg)
 
         for member in runtime.reconcile():
-            left = self.message_bus.drain(member.id) if self.message_bus else []
+            left = self.message_bus.drain(member.id)
             #线程意外终止是必须让模型知道的事(它的活没人接手了),所以唤醒
             self._notice(f"成员 {member.id}({member.name}) 的线程已意外终止(状态改为 dead)"
                          + (f",清理 {len(left)} 条遗留消息" if left else "")
@@ -739,29 +736,26 @@ class ClaudeMini():
                 return
             self._handle_control(msg)
 
-    def _team_guard(self, name):
-        msg = (f"❌ 团队成员不能调用 {name}(成员表的写权限只属于主agent,避免无限扩张)。"
-               f"你可以用 team_list 查看团队、用 send_message 和同事或主agent协作。")
-        return lambda *_a, **_kw: msg      #兼容位置/关键字两种调用方式
-
     #子agent
     def run_subagent(self, prompt: str):
         """启动一个独立子agent执行指定任务"""
-        if not self.allow_subagent:
-            return ("❌ 子agent禁止再次启动子agent(避免无限递归)。"
-                    "请在当前层级直接完成任务,或把需要分步的部分带回父agent处理。")
+        #只有主agent能起子agent。别的角色在工具层已经拦住了(看不到 subagent),
+        #这里必须再拦一道,因为 recall_memory 会**直接内部调用**本方法 ——
+        #那条路径不经过 excute_tool,也就没有运行时的那道检查
+        if self.role != ROLE_MAIN:
+            return "❌ 只有主agent能起子agent。自己做,或把需求带回父agent。"
 
         HOOKS.trigger_hooks("BefSubAgent",prompt)
 
         subagent_prompt = SUBAGENT_PROMPT + "\n" + prompt
 
-        #子agent:禁再起子agent、禁写记忆、禁recall_memory(防递归+防污染共享记忆库);共享同一任务库
-        #scheduler 必须共享同一实例(锁与扫描线程不可复制),但禁其领定时任务(allow_jobs=False)
-        subagent = ClaudeMini(slient=False, allow_recall_memory=False,
-                              allow_subagent=False, allow_write_memory=False,
+        #子agent:身份是 subagent,天然没有"起子agent/写记忆/recall_memory/定时任务/团队"这些工具。
+        #**不注入总线** —— 它是一次性的、没有信箱,而且没传 agent_name 时它的 agent_id 就是 "main":
+        #真让它共享总线,它 run() 里的 collect_team_messages 就会去 drain 主agent的收件箱,把主人的消息抢走。
+        #scheduler 必须共享同一实例(锁与扫描线程不可复制)
+        subagent = ClaudeMini(slient=False, role=ROLE_SUBAGENT,
                               task_store=self.task_store,
-                              scheduler=self.scheduler, allow_jobs=False,
-                              mcp=self.mcp)
+                              scheduler=self.scheduler, mcp=self.mcp)
 
         history = [
             {
@@ -779,8 +773,6 @@ class ClaudeMini():
     #记忆召回
     def recall_memory(self, query: str = None) -> str:
         """通过子 agent 召回相关记忆"""
-        if not self.allow_recall_memory:
-            return "❌ 子agent禁止调用 recall_memory(会造成子agent递归)。如需检索记忆,请直接 read_file 读取 memory/experience/index.json 及各记忆文件。"
         all_tags = self.memory_manager.get_all_tags()
         tags_hint = "可用标签: " + ", ".join(all_tags) if all_tags else "暂无标签"
 
@@ -805,23 +797,36 @@ class ClaudeMini():
         if block.type != "tool_use":
             raise ValueError(f"Invalid block type: {block.type}. Expected 'tool_use'.")
 
+        #运行时那道保险:看不见的工具模型不会去调,所以正常路径下不会命中。
+        #但幻觉出来的名字、压缩后重放的历史、以后新增的调用路径都可能绕过来,调之前再对一次。
+        if block.name not in self.allowed_tools:
+            return f"❌ {block.name} 对「{self.role}」不可用。{ROLE_HINT[self.role]}"
+
+        #PreToolUse 必须在**下面每一条分支之前**过一遍。原来"后台 bash"那条分支在它上面
+        #直接 return,等于后台命令完全不做权限检查 —— 加个 is_background=True,
+        #"rm -rf /" 就把 DENY 表绕过去了(background.py 自己也不调 hook,它拿到 command
+        #就直接 execute_bash)。
+        #也**不能**改成"挪进 BackgroundManager 的线程里再过":permission_hook 是靠
+        #"是不是主线程"来决定能不能弹窗问用户的(HOOKS.py:36),在后台线程里问,
+        #主agent自己那条正常命令也会被当成"成员弹不了窗"直接拒掉。
+        #结论:权限判定属于**发起调用的线程**,所以必须在这里做。
+        hook_result = HOOKS.trigger_hooks("PreToolUse", block)
+        if hook_result is not None:
+            print(f"Hook result: {hook_result}")
+            return hook_result
+
         if block.input.get("is_background") and block.name == "bash":
             # 后台执行工具
             task_id = self.background_manager.start(block)
-            output = f"🔄 工具 {task_id} 已在后台执行。"
-            return output
+            return f"🔄 工具 {task_id} 已在后台执行。"
+
         #获取工具处理函数
         handler = self.tool_registry.get(block.name)
         if handler is None:
             return f"❌ Unknown tool: {block.name}"
 
-        hook_result = HOOKS.trigger_hooks("PreToolUse", block)
-        if hook_result is not None:
-            output = hook_result
-            print(f"Hook result: {output}")
-        else:
-            output = self._call_tool(handler, block)
-            #print(f"Tool {block.name} executed with output: {output}")
+        output = self._call_tool(handler, block)
+        #print(f"Tool {block.name} executed with output: {output}")
         return output
 
     def _call_tool(self, handler, block):
@@ -850,9 +855,14 @@ class ClaudeMini():
 
         哪些工具最终留得下(和原生工具撞名的会被剔掉)由 MCPManager.collect 统一裁决,
         所以注册和 schema 天然是同一个集合 —— 不会出现"注册了却没说"或"说了却调不动"。
+
+        reserved 传的是**完整**的原生工具名,而不是本角色过滤后的:
+        防撞名是安全措施,不该因为某个角色看不见某个工具,就给 MCP 留出顶替它名字的机会。
         """
         schemas, handlers = self.mcp.collect(reserved={t["name"] for t in Tools})
         for name, handler in handlers.items():
+            if name in self.denied_tools:
+                continue        #角色表点名禁掉的 MCP 工具,连 handler 也不注册
             self.tool_registry.register(name, handler)
         return schemas
 
@@ -890,18 +900,7 @@ class ClaudeMini():
             "content": notifications
         }
 
-    #===== 定时任务工具 handler =====     
-
-    #守卫桩工厂:被禁用的工具不裸报错,而是返回一句指引(lambda 捕获工具名)
-    def _job_guard(self, name):
-        msg = (f"❌ 子agent禁止调用 {name}(定时任务统一由主agent管理,避免重复创建/重复执行)。"
-               f"请直接完成手头工作,或把需要定时的需求带回父agent。")
-        return lambda *_a, **_kw: msg      #兼容位置/关键字两种调用方式
-
-    def _memory_guard(self, name):
-        msg = (f"❌ 子agent禁止调用 {name}(避免污染共享记忆库)。"
-               f"如需保存记忆,请让父agent(主对话)调用 {name}。")
-        return lambda **_kw: msg
+    #===== 定时任务工具 handler =====
 
     def job_create(self, content, schedule=None, once_at=None):
         try:
