@@ -1,10 +1,10 @@
 # ClaudeMini 项目报告
 
-> 一个借鉴 Claude Code 思路实现的迷你代码 Agent。核心能力:**四层上下文压缩** + **长期记忆(模型自主行为)** + **定时任务(到点唤醒)**。
+> 一个借鉴 Claude Code 思路实现的迷你代码 Agent。核心能力:**四层上下文压缩** + **长期记忆(模型自主行为)** + **定时任务(到点唤醒)** + **Agent 团队(多 agent 常驻协作)** + **MCP(把外部进程的工具并进来)**。
 > 本文档面向第一次接触该项目的人,目标是快速建立对**实现、架构、特点**的整体认知。
 
-- 报告日期:2026-08-26(2026-09-06 更新:新增记忆子系统,记忆=模型自主行为;2026-09-15 更新:新增任务规划/后台任务/定时任务三个子系统并删除旧的 todo 机制,见 §6.9–§6.11)
-- 代码规模:15 个 Python 源文件(main / claude / llm / TOOLS / compact / HOOKS / PERMISSIONS / PROMPT / skill / memory / task / bash_exec / background / corn_job / agent_runner)
+- 报告日期:2026-08-26(2026-09-06 更新:新增记忆子系统,记忆=模型自主行为;2026-09-15 更新:新增任务规划/后台任务/定时任务三个子系统并删除旧的 todo 机制,见 §6.9–§6.11;2026-09-18 更新:新增 **Agent 团队**子系统 §6.12 与 **MCP** 接入 §6.13,补上此前遗漏的 `write_file` 工具)
+- 代码规模:18 个 Python 源文件(main / claude / llm / TOOLS / compact / HOOKS / PERMISSIONS / PROMPT / skill / memory / task / bash_exec / background / corn_job / agent_runner / message / team / mcp),另有 1 个**不入库**的本地测试服务器 `mcp_demo_server.py`(见 §6.13)
 - 运行环境:Windows / Python 3.13
 - 模型接入:MiniMax-M2.7(通过 Anthropic 兼容 API)
 
@@ -19,17 +19,19 @@ ClaudeMini 是一个**命令行交互的代码 Agent**:用户在终端提问,它
 - **入口**:`main.py`
 - **Agent 核心**:`claude.py`(`ClaudeMini` 类)
 - **模型通信**:`llm.py`
-- **工具**:`TOOLS.py` 声明 19 个工具 Schema(计算器 / bash / 读文件 / 5 个 `task_*` / 7 个 `job_*` / subagent / load_skill / 记忆),处理函数一部分随注册表出厂(`create_default_registry`),一部分是各功能模块的工厂(`task.create_task_handlers` / `memory.create_handlers`),其余是 `ClaudeMini` 的方法——统一由 `claude.py.__init__` 注册
+- **工具**:`TOOLS.py` 声明 25 个工具 Schema(计算器 / bash / 读写文件 / 5 个 `task_*` / 7 个 `job_*` / subagent / load_skill / 2 个记忆 / 5 个团队),处理函数一部分随注册表出厂(`create_default_registry`),一部分是各功能模块的工厂(`task.create_task_handlers` / `memory.create_handlers`),其余是 `ClaudeMini` 的方法——统一由 `claude.py.__init__` 注册
 - **上下文压缩**:`compact.py`(`CompactManager`)
 - **记忆**:`memory.py`(`MemoryManager`)+ `memory/` 目录(长期 / 经验 / 快照)
 - **任务规划**:`task.py`(`Task` + `TaskStore`)+ `.task/tasks.json`(带依赖的任务图)
 - **后台任务**:`background.py`(`BackgroundManager`)+ `bash_exec.py`(Git Bash 定位与执行)
 - **定时任务**:`corn_job.py`(`Job` + `Scheduler`)+ `agent_runner.py`(`AgentRunner` 唤醒)+ `.task/jobs.json` 任务库
+- **Agent 团队**:`message.py`(消息总线)+ `team.py`(成员注册表 `TeamRuntime`)+ `claude.py` 的 `run_forever` / 下线握手——成员是**常驻**的独立 agent,各占一条线程(§6.12)
+- **MCP**:`mcp.py`(`MCPClient` + `MCPManager`)+ `mcp_servers.json`(服务器清单)——用 stdio 连外部进程,把它的工具并进本项目的工具表(§6.13)
 - **Hook 事件系统**:`HOOKS.py` + 命令权限 `PERMISSIONS.py`
 - **Skill 加载**:`skill.py`
-- **提示词**:`PROMPT.py`
+- **提示词**:`PROMPT.py`(含团队成员与下线确认两份专用提示词)
 
-**一句话特点**:它把 Claude Code 里那些「隐性机制」——上下文压缩、权限钩子、任务图规划、后台任务、子 agent、按需加载 skill、定时任务唤醒——显式地拆成了一个个可以看懂、可以改的 Python 模块。
+**一句话特点**:它把 Claude Code 里那些「隐性机制」——上下文压缩、权限钩子、任务图规划、后台任务、子 agent、按需加载 skill、定时任务唤醒、**多 agent 团队协作**、**外部工具协议**——显式地拆成了一个个可以看懂、可以改的 Python 模块。
 
 ---
 
@@ -39,14 +41,16 @@ ClaudeMini 是一个**命令行交互的代码 Agent**:用户在终端提问,它
 
 ClaudeMini 是一个 **Mini Agent / Agent 教学与实验项目**。作者用 Python 手写了一个具备下述能力的 agent:
 
-1. **工具调用循环**——模型可以调用 `bash`、`read_file`、`calculator` 等工具并拿到结果;
+1. **工具调用循环**——模型可以调用 `bash`、`read_file`、`write_file`、`calculator` 等工具并拿到结果;
 2. **任务规划**——用 `task_create` / `task_list` / `task_claim` / `task_complete` 维护一张**带依赖的**任务图(见 §6.10);
 3. **子 Agent(SubAgent)**——主 agent 可以把任务拆给一个全新的 `ClaudeMini` 实例去独立执行;
 4. **Skill 按需加载**——扫描 `SKILLS/` 目录,把 skill 目录清单写进系统提示词,模型需要时通过 `load_skill` 工具读取完整内容;
 5. **后台 bash 任务**——长命令可以丢到后台线程跑,agent 不阻塞;结果在下一次循环开头以 `<task_notification>` 注入(见 §6.11);
 6. **上下文压缩**——用四层策略防止上下文无限膨胀;
 7. **长期记忆(模型自主)**——模型按需**自主调用** `write_memory` / `recall_memory` 读写经验记忆;整个会话结束后按文件数阈值做一次 **LLM 驱动的去重整理**(见 §6.8);
-8. **定时任务**——用 cron 五段式(`schedule`)或具体时刻(`once_at`)登记任务,调度器每分钟扫描、到点入队,`AgentRunner` 唤醒 agent 执行;这是**唯一一条不由用户输入驱动的执行路径**(见 §6.9)。
+8. **定时任务**——用 cron 五段式(`schedule`)或具体时刻(`once_at`)登记任务,调度器每分钟扫描、到点入队,`AgentRunner` 唤醒 agent 执行(见 §6.9);
+9. **Agent 团队**——用 `team_spawn` 拉起**常驻**团队成员(各自一条线程、一个独立的 `ClaudeMini` 实例),成员之间通过消息总线直接通信;`.run_forever()` 让成员在空闲阻塞与工作之间循环,下线要走一次**双方确认的握手**(见 §6.12);
+10. **MCP(Model Context Protocol)**——用 stdio 把外部进程当工具服务器拉起来,把它的工具并进本项目的工具表;配错的服务器只让 agent 少几个工具,不会挡住启动(见 §6.13)。
 
 ### 1.2 当前状态
 
@@ -56,7 +60,9 @@ ClaudeMini 是一个 **Mini Agent / Agent 教学与实验项目**。作者用 Py
 - **记忆子系统**(2026-09-06 设计定型):记忆是 **agent 行为** —— 不再每轮强制提取,而是由模型自主判断何时调用 `write_memory` / `recall_memory`;去重整理 `consolidate` 改为 **LLM 驱动**,在**整个会话结束**时按文件数阈值触发(详见 §6.8);
 - **任务规划重写**(2026-09):原本是内存态 todo 列表(`TaskManager` 单例 + `task_write` 工具 + 主循环里的 `<reminder>` 提醒),现已换成 `task.py` 的**带依赖任务图**并落盘 `.task/tasks.json`。旧的 `TaskManager` / `task_write` / `<reminder>` 机制**已从代码中删除**,本文档相应内容也已替换(详见 §6.10);
 - **后台任务**(2026-09):`bash` 工具支持 `is_background`,把长命令丢进守护线程,结果以 `<task_notification>` 在下一轮循环开头注入(详见 §6.11);
-- **定时任务子系统**(2026-09-15 设计定型):`Scheduler` 只做「扫描 + 入队」,`AgentRunner` 负责唤醒,agent 负责领取/执行/汇报;判定机制从「此刻是否匹配 cron」改为「`next_run` 欠不欠一次执行」,因此进程没运行的那段时间不再把任务静默丢掉(补跑一次,详见 §6.9)。
+- **定时任务子系统**(2026-09-15 设计定型):`Scheduler` 只做「扫描 + 入队」,`AgentRunner` 负责唤醒,agent 负责领取/执行/汇报;判定机制从「此刻是否匹配 cron」改为「`next_run` 欠不欠一次执行」,因此进程没运行的那段时间不再把任务静默丢掉(补跑一次,详见 §6.9);
+- **Agent 团队子系统**(2026-09-17 设计定型):`message.py` 提供消息总线、`team.py` 管理成员身份与状态、`claude.py` 的 `run_forever` 是成员的生命周期。**控制面与数据面分开**是这套设计的骨架——生命周期消息(下线请求/确认)由代码处理、绝不进 LLM,只有业务消息才交给模型。下线握手**必须有上限**,这条是压测逼出来的补丁(见 §6.12);
+- **MCP 接入**(2026-09-18):`mcp.py` 手写了 stdio 传输的 JSON-RPC 客户端,`ClaudeMini` 启动时读 `mcp_servers.json` 把外部服务器的工具并进工具表。这是本项目**第一次让工具来源超出自己的代码**(见 §6.13)。
 
 ### 1.3 设计取向
 
@@ -69,9 +75,9 @@ ClaudeMini 是一个 **Mini Agent / Agent 教学与实验项目**。作者用 Py
 ```
 claude_mini/
 ├── main.py              # 入口:用户输入循环 + Hook 注册 + AgentRunner 启动 + 会话末记忆整理触发
-├── claude.py            # ClaudeMini 类:agent 主循环 + 子 agent 编排 + 记忆/定时任务工具注册
+├── claude.py            # ClaudeMini 类:agent 主循环 + 子 agent/团队成员编排 + 全部工具注册 + 下线握手
 ├── llm.py               # LLM 封装:与 API 通信、历史总结
-├── TOOLS.py             # 工具 Schema 声明 + 处理函数 + ToolRegistry + 任务规划 handlers
+├── TOOLS.py             # 工具 Schema 声明 + 处理函数 + ToolRegistry
 ├── compact.py           # CompactManager:四层上下文压缩
 ├── memory.py            # MemoryManager:长期/经验记忆读写、索引、LLM 去重整理
 ├── corn_job.py          # Job + Scheduler:定时任务模型、cron 解析、扫描入队(§6.9)
@@ -79,14 +85,22 @@ claude_mini/
 ├── task.py              # Task + TaskStore + create_task_handlers 工厂:多步任务规划(依赖图 + 工具包装)
 ├── bash_exec.py         # bash 执行封装(resolve_bash 定位 Git Bash、execute_bash 执行)
 ├── background.py        # BackgroundManager:后台 bash 任务与结果回收
+├── message.py           # Message + MessageBus:团队消息总线(存储转发,纯基础设施,§6.12)
+├── team.py              # Member + TeamRuntime:成员身份(ID)与生命周期状态、控制消息类型(§6.12)
+├── mcp.py               # MCPClient + MCPManager:stdio 连外部 MCP 服务器并并入工具(§6.13)
+├── mcp_demo_server.py   # 本地测试用的最小 MCP 服务器(echo/add/now)。**不入库**,见 §6.13
+├── mcp_servers.json     # MCP 服务器清单(§6.13)
 ├── HOOKS.py             # 事件系统(仿 Claude Code 的 hook 事件)
 ├── PERMISSIONS.py       # bash 命令权限:DENY / ASK / ALLOW
-├── PROMPT.py            # SYSTEM_PROMPT / SUBAGENT_PROMPT
+├── PROMPT.py            # SYSTEM_PROMPT / SUBAGENT_PROMPT / TEAM_MEMBER_PROMPT / OFFLINE_CONFIRM_PROMPT
 ├── skill.py             # SkillLoader:扫描 SKILLS/ 并加载 SKILL.md
 ├── SKILLS/              # skill 目录(每个子目录一个 SKILL.md)
 │   ├── say_hello/SKILL.md
 │   └── security-review/SKILL.md
-├── .env                 # 配置(API key / 模型 / 压缩阈值 / 记忆阈值等)
+├── .env                 # 配置(API key / 模型 / 压缩阈值 / 记忆阈值等)。**永不入库**
+├── .env.example         # 脱敏模板(密钥位留空),入库
+├── .gitignore / .gitattributes   # 忽略规则 / 二进制标注(见 §10.3)
+├── 版本控制.md          # git 日常用法与回退手册
 ├── .task/               # 运行时任务库(不随代码提交)
 │   ├── jobs.json        #   定时任务库(§6.9)
 │   └── tasks.json       #   任务规划库
@@ -95,13 +109,12 @@ claude_mini/
 │   ├── experience/      #   经验记忆 *.md(frontmatter + index.json)
 │   ├── temp/            #   预留
 │   └── backups/         #   consolidate 前的快照 snapshot_<ts>(保留最近 N 份)
-├── tool_result/         # 过长工具结果的落盘目录(运行时生成)
-├── transcript           # 消息数量压缩时的归档文件(运行时生成)
+├── tool_result/         # 过长工具结果的落盘目录(运行时生成,不随代码提交)
+├── transcript           # 消息数量压缩时的归档文件(运行时生成,不随代码提交)
 ├── __pycache__/         # 编译缓存(含一个已删除源文件的 claude_debug.pyc)
 └── PROJECT_REPORT.md    # 本文档
 ```
 
-> 注:`__pycache__/claude_debug.cpython-313.pyc` 说明曾有一个 `claude_debug.py` 调试脚本,源码已删除。
 
 ---
 
@@ -110,37 +123,47 @@ claude_mini/
 ### 3.1 分层结构
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│  main.py            入口层                                │
-│   · 注册 Hook         · 用户输入循环                       │
-└──────────────┬───────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────┐
+│  main.py            入口层                                    │
+│   · 注册 Hook    · 用户输入循环(1 秒超时,顺手收团队消息)      │
+└──────────────┬───────────────────────────────────────────────┘
                ▼
-┌──────────────────────────────────────────────────────────┐
-│  ClaudeMini  (claude.py)    —— Agent 核心                 │
-│   · agent 主循环(run)                                     │
-│   · 子 agent 编排(run_subagent)                           │
-│  ┌────────────┬────────────┬────────────┬──────────────┐ │
-│  │ LLM        │ ToolRegistry│ SkillLoader│ CompactManager│ │
-│  │ (llm.py)   │ (TOOLS.py) │ (skill.py) │ (compact.py) │ │
-│  └────────────┴────────────┴────────────┴──────────────┘ │
-└──────┬──────────────────────────────────┬─────────────────┘
-       ▼                                  ▼
-   MiniMax M2.7 API                 HOOKS.py ──▶ PERMISSIONS.py
-   (Anthropic 兼容接口)             PROMPT.py
+┌──────────────────────────────────────────────────────────────┐
+│  ClaudeMini  (claude.py)    —— Agent 核心                     │
+│   · agent 主循环(run)                                         │
+│   · 子 agent 编排(run_subagent)                               │
+│   · 团队成员编排(team_spawn / run_forever / 下线握手)         │
+│  ┌──────────┬────────────┬───────────┬─────────────┬───────┐ │
+│  │ LLM      │ToolRegistry│SkillLoader│CompactManager│  MCP  │ │
+│  │ (llm.py) │ (TOOLS.py) │(skill.py) │ (compact.py)│(mcp.py)│ │
+│  └──────────┴────────────┴───────────┴─────────────┴───────┘ │
+└──┬───────────────┬───────────────────────┬───────────────────┘
+   ▼               ▼                       ▼
+MiniMax M2.7   HOOKS.py ──▶          MessageBus(message.py)
+(Anthropic     PERMISSIONS.py              ▲
+ 兼容接口)     PROMPT.py                   │ 存储转发
+                                    ┌──────┴────────┐
+                                    │  成员 A 线程  │  ← 各自一个 ClaudeMini 实例
+                                    │  成员 B 线程  │     共享 bus / TeamRuntime /
+                                    └───────────────┘      MCP / TaskStore / Scheduler
+
+   MCPManager ──stdio(JSON-RPC)──▶  MCP 服务器子进程(工具来自项目之外)
 ```
 
 > `ClaudeMini` 还持有 **`MemoryManager`**(memory.py),初始化时把 `write_memory` / `recall_memory` 动态注册进 ToolRegistry;长期记忆(`long_term/`)随 system prompt 注入(见 §6.8)。
 >
-> `ClaudeMini` 还持有 **`Scheduler`**(corn_job.py),初始化时注册 7 个 `job_*` 工具并启动扫描线程;`main.py` 另外启动 **`AgentRunner`**(agent_runner.py),由它轮询队列、唤醒 agent 去执行定时任务(见 §6.9)。这是**唯一一条不由用户输入驱动的执行路径**。
+> `ClaudeMini` 还持有 **`Scheduler`**(corn_job.py),初始化时注册 7 个 `job_*` 工具并启动扫描线程;`main.py` 另外启动 **`AgentRunner`**(agent_runner.py),由它轮询队列、唤醒 agent 去执行定时任务(见 §6.9)。
+>
+> **共享实例清单**(构造时透传,是这一层最要紧的约束):`task_store` / `scheduler` / `message_bus` / `team_runtime` / `mcp` —— 它们背后分别是「唯一一份任务库」「一把不可复制的锁 + 一条扫描线程」「一条总线」「一张成员表」「一个子进程 + 一条读线程」。**每一份都不能复制**,所以整棵 agent 树(主 agent / 子 agent / 每个团队成员)共享同一批实例(§6.12、§6.13)。
 
 ### 3.2 模块职责一句话
 
 | 模块 | 职责 |
 |---|---|
-| `main.py` | 终端入口。注册权限 Hook,启动 `AgentRunner`,循环读用户输入,调用 `ClaudeMini.run()` |
-| `claude.py` | Agent 大脑。持有 LLM/工具/skill/压缩器/记忆/调度器,驱动主循环;子 agent 递归入口 |
+| `main.py` | 终端入口。注册权限 Hook,启动 `AgentRunner`,循环读用户输入(1 秒超时,超时那一趟用来推进团队控制面),调用 `ClaudeMini.run()` |
+| `claude.py` | Agent 大脑。持有 LLM/工具/skill/压缩器/记忆/调度器/消息总线/成员表/MCP,驱动主循环;子 agent 递归入口;团队成员的生命周期(`run_forever`)与下线握手都在这里 |
 | `llm.py` | 与模型 API 通信(`send`),以及历史总结(`summarize`/`summarize_history`) |
-| `TOOLS.py` | 工具的世界。声明全部 19 个工具 Schema(基础工具 + `task_*` + `job_*` + subagent/load_skill/记忆)、部分内置处理函数、`ToolRegistry` 注册表 |
+| `TOOLS.py` | 工具的世界。声明全部 25 个工具 Schema(基础工具 + `task_*` + `job_*` + subagent/load_skill/记忆/团队)、部分内置处理函数、`ToolRegistry` 注册表 |
 | `compact.py` | 上下文压缩器,四层策略(见 §5) |
 | `memory.py` | 记忆管理器。long_term 只读注入;experience 读写+索引;模型按需 `write_memory`/`recall_memory`;会话末 `consolidate_if_due` LLM 去重整理(见 §6.8) |
 | `corn_job.py` | 定时任务。`Job` 模型 + cron 解析 + `Scheduler`(每分钟扫描、入队、状态机、落盘)(见 §6.9) |
@@ -148,10 +171,13 @@ claude_mini/
 | `task.py` | 任务规划。`Task` 三态 + `TaskStore` + `create_task_handlers` 工厂:任务图、依赖检查、认领者校验、落盘(见 §6.10) |
 | `background.py` | 后台任务。`BackgroundManager`:后台线程执行 bash、结果回收与有界等待(见 §6.11) |
 | `bash_exec.py` | bash 执行底座。`resolve_bash` 定位 Git Bash、`execute_bash` 同步执行且永不抛错(见 §6.11) |
-| `HOOKS.py` | 事件系统。`PreToolUse`/`PostToolUse`/`Stop` 等事件,`trigger_hooks` 短路返回 |
+| `message.py` | 消息总线。`Message`(带 `kind`)+ `MessageBus`:阻塞收、非阻塞取、只看不取三种读法,纯基础设施不懂消息类型(见 §6.12) |
+| `team.py` | 成员注册表。`Member` + `TeamRuntime`:身份(ID 唯一不回收)、四种逻辑状态、控制消息类型常量、线程事实对账(见 §6.12) |
+| `mcp.py` | MCP 客户端。`MCPClient`(stdio + JSON-RPC,读线程 + 请求串行锁)+ `MCPManager`(读配置、连服务器、汇总工具、退出收子进程)(见 §6.13) |
+| `HOOKS.py` | 事件系统。`PreToolUse`/`PostToolUse`/`Stop` 等事件,`trigger_hooks` 短路返回;权限钩子兼管「非主线程不许弹交互询问」 |
 | `PERMISSIONS.py` | 命令权限判定(DENY/ASK/ALLOW),供 `permission_hook` 使用 |
 | `skill.py` | 扫描 `SKILLS/` 目录,解析 `SKILL.md` 的 `name`/`description`,按需加载内容 |
-| `PROMPT.py` | 主 agent 与子 agent 的系统提示词(中文) |
+| `PROMPT.py` | 四份提示词:主 agent / 子 agent / **团队成员**(`TEAM_MEMBER_PROMPT`)/ **下线确认回合**(`OFFLINE_CONFIRM_PROMPT`)(中文) |
 
 ---
 
@@ -161,7 +187,7 @@ claude_mini/
 
 ```mermaid
 flowchart TD
-    A["① 收集后台任务结果<br/>collect + build_task_notifications"] --> B["② 把 history 发送给 LLM<br/>llm.send(history)"]
+    A["① 收本轮的开场消息<br/>后台任务结果 + 团队消息"] --> B["② 把 history 发送给 LLM<br/>llm.send(history)"]
     B --> C["③ micro_compact<br/>归档模型已读过的旧工具结果"]
     C --> D["④ 解析响应<br/>thinking / text / tool_use"]
     D --> E{"⑤ 有 tool_use?"}
@@ -177,7 +203,9 @@ flowchart TD
 
 ### 4.1 逐步说明
 
-1. **收后台任务结果**`claude.py:89-93`——每轮开头先 `background_manager.collect()` 取走已完成的后台任务,用 `build_task_notifications` 包成 `<task_notification>` 文本块拼进 history(见 §6.11)。**这就是「后台任务跑完会主动告诉模型」的实现**,不需要模型轮询。
+1. **收本轮的开场消息**——两件事,都在每轮开头、发模型之前:
+   - `background_manager.collect()` 取走已完成的后台任务,用 `build_task_notifications` 包成 `<task_notification>` 文本块拼进 history(`claude.py:161-164`)。**这就是「后台任务跑完会主动告诉模型」的实现**,不需要模型轮询(见 §6.11);
+   - `collect_team_messages()` 取走消息总线里发给自己的消息(`claude.py:166-168`)。它是**非阻塞**的:主 agent 由用户输入驱动,不能像团队成员那样挂在 `receive()` 上等消息。取到的普通消息拼成 `<team_message>`,成员上下线通知拼成 `<team_notice>`,控制消息**就地交给代码处理、不进 LLM**(见 §6.12)。
 
 2. **发送**`claude.py:96`——把 `system_prompt` + 完整 `history` 发给模型。`system_prompt` 由 `PROMPT.SYSTEM_PROMPT` + 长期记忆 + **当前时间** + skill 目录清单拼接而成(`claude.py:27-35`)。发送若因 prompt 过长失败,会走一次「压缩后重试」(`claude.py:95-107`)。
 
@@ -207,18 +235,20 @@ flowchart TD
 
 ### 4.2 子 Agent(SubAgent)
 
-`run_subagent(prompt)`(`claude.py:173`):
+`run_subagent(prompt)`(`claude.py:748`):
 
-- 触发 `BefSubAgent` Hook,打印一个装饰框(`HOOKS.py:41`);
-- 用 `SUBAGENT_PROMPT + prompt` 构造一段历史,`new ClaudeMini(slient=False, ...)` 启动一个**全新的 agent 实例**递归运行(`claude.py:185-197`);
+- 触发 `BefSubAgent` Hook,打印一个装饰框(`HOOKS.py:49`);
+- 用 `SUBAGENT_PROMPT + prompt` 构造一段历史,`new ClaudeMini(slient=False, ...)` 启动一个**全新的 agent 实例**递归运行(`claude.py:760-773`);
 - 触发 `AftSubAgent` Hook,返回 `subagent.run()` 的结果(即子 agent 最后一轮的文字输出)。
 
 设计要点:
 
 - 子 agent 是**完整独立实例**,有自己的工具注册表、skill 加载器、压缩器;
 - 系统提示词(`PROMPT.py`)明确要求主 agent **不要轻信子 agent 的声明,必须用工具验证结果**;
-- **共享与隔离是显式选择的**,都在 `claude.py:185-188` 一行里:共享 `task_store` 与 `scheduler`(它们是**实例**——任务库只有一份、锁不能跨实例),隔离的是四个布尔开关(`allow_subagent` / `allow_write_memory` / `allow_recall_memory` / `allow_jobs` 全部关掉,防递归、防污染共享库、防定时任务被领两次);
-- 被禁用的工具仍然**注册**,只是注册成「守卫桩」:返回一句中文指引,而不是让模型撞上 `Unknown tool`。三种守卫写法并存:`_memory_guard` / `_job_guard`(两个闭包桩工厂,`claude.py:279`、`:284`)、`recall_memory` 方法内自检(`claude.py:206`)。
+- **共享与隔离都是显式选择的**,都在 `claude.py:756-758` 一处:共享 `task_store` / `scheduler` / `mcp`(它们是**实例**——任务库只有一份、锁不能跨实例、MCP 背后是子进程),隔离则只靠一个参数 `role=ROLE_SUBAGENT` —— 这一个身份同时决定了「它没有哪些工具」和「它看哪份提示词」,防递归、防污染共享库、防定时任务被领两次都落在它身上(§6.3);
+- 被禁用的工具**干脆不存在**:模型看不到(`self.tools` 里没有),运行时也调不动(registry 里没有)。以前的做法是照样注册、但注册成「守卫桩」返回一句中文指引(三个闭包桩工厂 `_memory_guard` / `_job_guard` / `_team_guard`),**桩现已全部删除** —— 留着桩等于留一个「模型看得见、却永远失败」的工具名,而这次改造要消灭的正是这种东西(§6.3)。
+
+> **子 agent 与团队成员的区别**(容易混,一句话):子 agent 是**一次性的**——`run_subagent` 阻塞等到它跑完、拿到返回值就销毁;团队成员是**常驻的**——`team_spawn` 立刻返回,成员在自己的线程里活着,等你继续派活,直到走完下线握手。要「一次拿到结果」用 subagent,要「反复来回沟通 / 并行推进」才建团队(详见 §6.12)。
 
 ### 4.3 记忆工具与会话末整理(模型自主)
 
@@ -307,17 +337,25 @@ len(messages) > MAX_MESSAGES 时:
 
 ### 6.1 `claude.py` — Agent 核心
 
-- `ClaudeMini.__init__`(`:16-77`):**只做装配与注册,不定义任何方法**——组装 skill 加载器 / 压缩器 / 记忆管理器 / 后台任务管理器,拼系统提示词(基础提示词 + 长期记忆 + **当前时间** + skill 清单),建 LLM,然后**把所有工具注册进同一个 `ToolRegistry`**——顺序是:基础工具(`create_default_registry`,3 个)→ `subagent` / `load_skill` / `recall_memory` → 记忆工具 → 任务规划工具 → 定时任务工具(`:69-76`)。
-- `run(history)`(`:80`):主循环(§4.1)。
-- `run_subagent(prompt)`(`:173`):子 agent 递归入口(§4.2)。
-- `recall_memory(query)`(`:204`):记忆召回(起子 agent 检索)。
-- `excute_tool(block)`(`:228`):单条工具调用的执行入口——后台 bash 分支在这里分叉(§6.11)。
-- `build_task_notifications(results)`(`:253`):把后台任务结果包成 `<task_notification>`。
-- **7 个 `job_*` 工具方法 + 2 个守卫桩工厂**(`:275-345`):与 `subagent` / `recall_memory` 一样是**类的方法**,`__init__` 只负责注册。
-- 三个重要耦合:
-  - **工具「声明在 `TOOLS.py`、实现是 `ClaudeMini` 的方法」**:`subagent`、`load_skill`、`recall_memory`、`job_*` 的 Schema 都在 `TOOLS.py`,处理函数是类方法(注册时取 bound method,如 `register("job_create", self.job_create)`);任务规划那 5 个走 `task.create_task_handlers(store)` 工厂、写记忆走 `memory.create_handlers()`——**工厂住在它包装的组件旁边,依赖(store/实例)由 `claude.py` 递进去**,`TOOLS.py` 因此只剩 Schema、无依赖的内置函数和注册表,依赖方向保持单向;
-  - **Hook 可以短路工具执行**:`HOOKS.trigger_hooks` 返回非空就跳过 handler(`:315-322`);
-  - **`task_store` 与 `scheduler` 是构造参数**(`:62`、`:69`),可注入——这是主/子 agent 共享同一份任务库与调度器的前提(§4.2、§6.9)。
+- `ClaudeMini.__init__`(`:34-147`):**只做装配与注册,不定义任何方法**——组装 skill 加载器 / 压缩器 / 记忆管理器 / 后台任务管理器,拼系统提示词(基础提示词 + 长期记忆 + **当前时间** + skill 清单;**团队成员还要再追加一份 `TEAM_MEMBER_PROMPT`**,见 `:70-71`),建 LLM,然后**把所有工具注册进同一个 `ToolRegistry`**。因为工具来源变多了,注册顺序在 `:45-54` 处有个坑要绕:**`self.tools` 必须是 `list(Tools)` 新建的副本**,不能直接 `self.tools = Tools`(`Tools` 是模块级列表,`+=` 会就地改它,于是每建一个 agent 就给那个全局列表追加一遍 MCP 工具,同一个工具名在 schema 里出现多次);`tool_registry` 也要提前建,因为注册 MCP 工具要用它。
+- `run(history)`(`:151`):主循环(§4.1)。
+- `run_forever()`(`:249`):**团队成员的生命周期**(idle → work → idle,直到下线确认)。只有接了 `message_bus` 才能进这个模式(§6.12)。
+- `send_message(to, content)`(`:299`):给同事或主 agent 发消息。发之前**先确认收件人还在岗**——不存在/已下线的直接拒绝,不能让消息留在总线上等「未来某个 agent」错误消费。
+- `collect_team_messages()`(`:331`)/ `has_team_message()`(`:364`)/ `process_control_messages()`(`:480`):主 agent 侧的三种取消息姿势(取走 / 只看 / 只取控制消息),对应它「不能阻塞等消息」的处境。
+- `team_spawn`(`:378`)/ `team_list`(`:422`)/ `team_stop`(`:430`)/ `team_offline_confirm`(`:467`):4 个团队工具。
+- **下线握手与看门狗**(`:504-729`):`_confirm_offline`(成员侧做最终确认)、`_reply_offline`、`_on_offline_reply`(主 agent 侧同步状态)、`_check_offline_timeouts`(到点查状态、决定重发还是判失灵)、`_give_up_on_member`、`_reconcile_team`(用线程事实对账)、`_drain_deferred_control`(处理 `run()` 期间被推迟的控制消息)。
+- `run_subagent(prompt)`(`:748`):子 agent 递归入口(§4.2)。
+- `recall_memory(query)`(`:780`):记忆召回(起子 agent 检索)。
+- `excute_tool(block)`(`:804`):单条工具调用的执行入口——后台 bash 分支在这里分叉(§6.11)。
+- `_call_tool`(`:827`):**handler 的调用都得从这儿过**。它把「调用姿势不对」退化成一条工具错误,绝不让异常穿出去——这不是洁癖,是被一次真实事故逼出来的(成员把 `team_offline_confirm` 的 `agree` 写成了 `content`,`handler(**block.input)` 当场抛 `TypeError`,异常一路穿到线程外:成员线程直接死掉、主 agent 的下线握手永远等不到确认,主 agent 侧则把整个会话带崩)。退化成工具错误后,模型能看到正确的参数名,自己改对重试。
+- `_register_mcp_tools()`(`:845`)/ `_tool_params()`(`:859`):MCP 工具注册 + 报错时把该工具的参数名回给模型(§6.13)。
+- `build_task_notifications(results)`(`:871`):把后台任务结果包成 `<task_notification>`。
+- **7 个 `job_*` 工具方法**(`:905-961`):与 `subagent` / `recall_memory` 一样是**类的方法**,`__init__` 只负责注册。
+- 四个重要耦合:
+  - **工具「声明在 `TOOLS.py`、实现是 `ClaudeMini` 的方法」**:`subagent`、`load_skill`、`recall_memory`、`job_*`、`send_message`、`team_*` 的 Schema 都在 `TOOLS.py`,处理函数是类方法(注册时取 bound method,如 `register("job_create", self.job_create)`);任务规划那 5 个走 `task.create_task_handlers(store)` 工厂、写记忆走 `memory.create_handlers()`、**MCP 工具走 `MCPManager.collect()`**——**工厂住在它包装的组件旁边,依赖(store/实例)由 `claude.py` 递进去**,`TOOLS.py` 因此只剩 Schema、无依赖的内置函数和注册表,依赖方向保持单向;
+  - **Hook 可以短路工具执行**:`HOOKS.trigger_hooks` 返回非空就跳过 handler(`:818-823`);
+  - **一串「不可复制」的实例是构造参数**(`:93`、`:100`、`:114`、`:131`、`:53`),可注入——这是主 agent / 子 agent / 团队成员共享同一份任务库、调度器、消息总线、成员表、MCP 的前提(§4.2、§6.9、§6.12、§6.13);
+  - **禁用也走构造参数,但只剩一个**:`role`(`:36`)。它换算成 `self.denied_tools`(`:46`)之后,**一处**决定了四件事——工具表过滤(`self.tools`)、registry 注册、运行时准入(`self.allowed_tools`)、以及看哪份提示词(`:90`)。以前是五个布尔开关各管一摊,而且「给哪些工具」和「给哪段提示词」是两套并行机制、各写各的、会互相漂移(§6.3)。
 
 ### 6.2 `llm.py` — 模型通信
 
@@ -329,25 +367,44 @@ len(messages) > MAX_MESSAGES 时:
 
 ### 6.3 `TOOLS.py` — 工具世界
 
-这个文件是**工具的唯一声明处**:19 个工具 Schema 全在 `Tools` 列表(`:8`)里,连处理函数都不在这里的那几个(记忆 / 任务 / 定时任务)也一样。它同时也放几个自包含的执行函数,但不 import `claude.py`——依赖方向始终是 `claude.py → TOOLS.py`。(任务工具的工厂 `create_task_handlers` 原先也在这里,现已搬到 `task.py`,工厂跟着它包装的组件走,见 §6.10。)
+这个文件是**工具的唯一声明处**:25 个工具 Schema 全在 `Tools` 列表(`:8`)里,连处理函数都不在这里的那几个(记忆 / 任务 / 定时任务 / 团队 / MCP)也一样。它同时也放几个自包含的执行函数,但不 import `claude.py`——依赖方向始终是 `claude.py → TOOLS.py`。(任务工具的工厂 `create_task_handlers` 原先也在这里,现已搬到 `task.py`,工厂跟着它包装的组件走,见 §6.10。)
 
-**19 个工具一览**(Schema 全在 `TOOLS.py`):
+**25 个工具一览**(Schema 全在 `TOOLS.py`;MCP 工具是**运行时**并进来的,不在这 25 个里,见 §6.13):
 
 | 工具 | 作用 | 处理函数在哪 |
 |---|---|---|
-| `calculator` | 计算器,`eval` 表达式 | `TOOLS.run_calculate`(`:328`) |
-| `bash` | 执行 shell 命令(Windows 上归一为 Git Bash) | `TOOLS.run_bash`(`:334`)→ `bash_exec.execute_bash` |
-| `read_file` | 读文件(支持行数限制) | `TOOLS.run_read`(`:339`) |
+| `calculator` | 计算器,`eval` 表达式 | `TOOLS.run_calculate`(`:437`) |
+| `bash` | 执行 shell 命令(Windows 上归一为 Git Bash) | `TOOLS.run_bash`(`:443`)→ `bash_exec.execute_bash` |
+| `read_file` | 读文件(支持行数限制) | `TOOLS.run_read`(`:448`) |
+| `write_file` | 写文件(整文件替换,自动建父目录) | `TOOLS.run_write`(`:464`) |
 | `task_create` / `task_list` / `task_get` / `task_claim` / `task_complete` | 任务图:创建(可带 `depends_on`)/ 列出 / 查看 / 认领 / 完成 | `task.create_task_handlers(store)`(`task.py:181`)包装 `TaskStore`(§6.10) |
-| `job_create` / `job_list` / `job_cancel` / `job_resume` / `job_delete` / `job_take` / `job_update_status` | 定时任务:创建 / 列出 / 取消 / 恢复 / 删除 / 领取 / 汇报 | `ClaudeMini` 的方法(`claude.py:289-345`,§6.9) |
+| `job_create` / `job_list` / `job_cancel` / `job_resume` / `job_delete` / `job_take` / `job_update_status` | 定时任务:创建 / 列出 / 取消 / 恢复 / 删除 / 领取 / 汇报 | `ClaudeMini` 的方法(`claude.py:906-957`,§6.9) |
 | `subagent` | 启动独立子 agent | `ClaudeMini.run_subagent` |
-| `load_skill` | 加载指定 skill | `TOOLS.load_skill`(`:420`)→ `skill.SkillLoader.load` |
+| `load_skill` | 加载指定 skill | `TOOLS.load_skill`(`:509`)→ `skill.SkillLoader.load` |
 | `write_memory` / `recall_memory` | 写 / 召回经验记忆(模型自主调用) | `memory.create_handlers()` 与 `ClaudeMini.recall_memory` |
+| `send_message` | 给团队成员或主 agent 发消息(ID 寻址) | `ClaudeMini.send_message`(§6.12) |
+| `team_spawn` / `team_list` / `team_stop` | 拉起常驻成员 / 查看成员表 / 请成员下线 | `ClaudeMini` 的方法(§6.12) |
+| `team_offline_confirm` | **仅成员可见**:对下线请求做最终确认 | `ClaudeMini.team_offline_confirm`(§6.12) |
 
 注册分两处,这个划分是有意的:
 
-- `create_default_registry()`(`:431`)注册**基础 3 件**(`calculator` / `bash` / `read_file`)——它们不依赖任何运行时状态,谁都能直接用;
-- 其余全部在 `ClaudeMini.__init__` 里注册——因为它们要么需要 `self`(子 agent、记忆),要么需要注入的实例(`task_store` / `scheduler`)。所以 `Tools` 列表里有、注册表里没有的名字,只可能是「这个实例没注册它」,不会出现「声明了却没人实现」。
+- `create_default_registry()`(`:520`)注册**基础 4 件**(`calculator` / `bash` / `read_file` / `write_file`)——它们不依赖任何运行时状态,谁都能直接用;
+- 其余全部在 `ClaudeMini.__init__` 里注册——因为它们要么需要 `self`(子 agent、记忆、团队、定时任务),要么需要注入的实例(`task_store` / `scheduler` / `mcp`)。它们先集中成一张 `native_handlers` 表,再**按身份一次性注册**:`if name not in self.denied_tools`(`claude.py:150-152`)。所以 `Tools` 列表里有、注册表里没有的名字,只可能是「这个角色没有它」,不会出现「声明了却没人实现」;
+
+**工具的可见性是分层的**——同一个 `TOOLS.py`,`ClaudeMini` 按 `role` 决定给哪些。禁用表是 `TOOLS.ROLE_DENIED`(`TOOLS.py:458`),**用黑名单**:工具多、要禁的少,而且「禁」和原来那批 `allow_*` 开关是同一个语义方向(禁 `subagent` 就是禁 `subagent`),属连续演化、不是语义反转。
+
+| `role` | 是谁 | 在这个身份上禁掉的 | 拥有 |
+|---|---|---|---|
+| `ROLE_MAIN` | 主 agent | `team_offline_confirm`(它是**成员**回答主 agent 用的) | 24 |
+| `ROLE_SUBAGENT` | 子 agent(一次性) | 起子 agent / 写记忆 / `recall_memory`、7 个 `job_*`、5 个团队工具全部禁 | 10 |
+| `ROLE_MEMBER` | 团队成员(常驻) | 同子 agent,但团队工具只禁「写」的两个(`team_spawn` / `team_stop`)——发消息、看成员表、做下线确认都是它该有的 | 13 |
+
+四点容易看漏的:
+
+- **`role` 是 `__init__` 的默认参数,不传就是主 agent**,所以「单 agent 模式」不再是独立形态:主 agent 拿到的就是完整工具集,`message_bus` 不传会自己建一条(`claude.py:111`),团队那套始终在;
+- **`team_offline_confirm` 是主 agent 唯一缺的那个**。以前它只是没注册 handler、schema 却照样发给模型(模型看得见、一调就 `Unknown tool`),现在整个名字都不出现;
+- **禁掉的名字拼错会静默失效**——不报错,也不禁任何东西,表现是「这工具怎么还能调」而没人会想到是表写错了。所以启动时用 `check_roles()` 对一遍(`TOOLS.py:498`),主 agent 建出来时打警告(`claude.py:70-72`)。
+- **`role` 管的是「有没有」,不管「这次准不准」**。已拥有的工具在具体一次调用时放不放行是**另一层**:`HOOKS` 的 `PreToolUse` → `PERMISSIONS.check_permission`,判定对象是**这一次调用的参数**(`bash` 命令危不危险、写入目标是不是落在 `memory/` 下),与身份正交。两层是双保险:模型看不见的工具不会去调,但幻觉出来的名字、压缩后重放的历史、以后新增的调用路径都可能绕过来,所以 `excute_tool` 开头还会拿 `self.allowed_tools` 再对一次(`claude.py:802`)。
 
 **其他要点**:
 
@@ -360,8 +417,9 @@ len(messages) > MAX_MESSAGES 时:
 
 - 事件集合(`:3`):`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop` / `BefSubAgent` / `AftSubAgent` —— 事件名明显仿照 Claude Code 的 hook 体系;
 - `register_hook(event, func)`(`:12`)注册,`trigger_hooks(event, ...)`(`:18`)**短路调用**:返回第一个非 `None` 的结果;
-- `permission_hook`(`:28`):`PreToolUse` 的默认权限实现——`DENY` 直接拒绝、`ASK` 交互式 `y/n` 询问、`ALLOW` 放行;
-- `before_agent_hook` / `after_agent_hook`(`:41-49`):子 agent 启停的装饰框打印。
+- `permission_hook`(`:29`):`PreToolUse` 的默认权限实现——`DENY` 直接拒绝、`ASK` 交互式 `y/n` 询问、`ALLOW` 放行;
+- **`ASK` 之前先查线程**(`:36-38`):**只有主线程能弹交互式询问**。团队成员在自己的线程里调 `input()` 会抢走 stdin,把主线程的输入卡死(表现出来就是整个终端没反应),所以非主线程一律直接拦下并说明原因。这是引入多线程 agent 之后必须补的一道;
+- `before_agent_hook` / `after_agent_hook`(`:49-58`):子 agent 启停的装饰框打印。
 
 > 目前只有 `PreToolUse`、`BefSubAgent`、`AftSubAgent` 被实际使用;`PostToolUse`/`Stop`/`UserPromptSubmit` 只是留好了接口。
 
@@ -386,11 +444,15 @@ len(messages) > MAX_MESSAGES 时:
 - `SYSTEM_PROMPT`(`:1`):定义了主 agent 的职责——
   - 任务规划(`:7-13`):多步任务用 `task_create` 逐条建节点、有先后依赖用 `depends_on`,执行中用 `task_list` 看进度与阻塞、`task_claim` 认领(有依赖的任务须等前置完成才能认领),每完成一步 `task_complete`;
   - 定时任务(`:16-45`):创建(`schedule` / `once_at` 二选一 + `content` 必须自包含)、管理(`job_cancel` 可恢复 / `job_delete` 不可恢复,拿不准先问)、执行(`job_take` → 按 content 执行 → `job_update_status` 必须汇报);
+  - **Agent Teams(`:82-147`)**:什么时候该建团队、什么时候该用 subagent、`send_message` 的通信规则(异步、content 自包含、别用 sleep 等)、怎么请成员下线;
   - SubAgent 使用规则:何时用、何时别滥用、**结果必须验证**;
   - Context Management(重点):教模型如何对待被截断/归档的工具结果——「不一定要读 PATH」,优先用摘要继续;真要读也**不要反复整读大文件**;「不要读取由 Context Compact 自动生成的 tool_result 文件来恢复上下文,除非确实需要」。
-- `SUBAGENT_PROMPT`(`:115`):子 agent 的执行规范,要求「不把任务转交给其他 Agent」「必须返回含验证结果的可判断信息,不能只回复『完成』」。
+- `SUBAGENT_PROMPT`(`:183`):子 agent 的执行规范,要求「不把任务转交给其他 Agent」「必须返回含验证结果的可判断信息,不能只回复『完成』」。
+- **`TEAM_MEMBER_PROMPT`(`:218`)**:成员看到的补充规则,**追加在 `SYSTEM_PROMPT` 之后**(只在 `role == ROLE_MEMBER` 时拼接,`claude.py:90-91`)。为什么非要单独写一份:上面那套「组建团队 / 让成员退出」的说明是给主 agent 的,成员照着做会出事——它会以为自己能建团队(**它连这个工具都没有**),甚至**谎报「已启动成员」**。这份文件把成员该知道的重新说一遍:不能建团队、不能起 subagent、干完活不自己退出、下线请求要如实做最终确认。
+  其中最长的一段是**反客套**:「不要发没有信息量的消息……仅仅表示『收到/同意/感谢/辛苦了』、或回一句客套话,一律不要发」。这不是文风偏好,是实测数据逼出来的(见 §6.12「客套风暴」)。
+- **`OFFLINE_CONFIRM_PROMPT`(`:224`)**:成员被请求下线时的**最后一个回合**注入,只让它做一件事——给明确结论。工具侧配套 `team_offline_confirm`(§6.12)。
 
-> 提示词与工具描述是**两份配套的说明书**:`PROMPT.py` 讲「什么时候该用哪类工具」,`TOOLS.py` 里每个工具的 `description` 讲「这个工具怎么用、边界在哪」。定时任务这块把「content 必须自包含」(到点后模型手里没有当时的对话)反复写进了两处,因为这是整套机制里最容易出错的地方。
+> 提示词与工具描述是**两份配套的说明书**:`PROMPT.py` 讲「什么时候该用哪类工具」,`TOOLS.py` 里每个工具的 `description` 讲「这个工具怎么用、边界在哪」。定时任务这块把「content 必须自包含」(到点后模型手里没有当时的对话)反复写进了两处,因为这是整套机制里最容易出错的地方。**团队这块同理**:「发消息是异步的,不要等」「content 必须自包含(成员看不到你和用户的对话)」也都在提示词和工具描述里各写了一遍。
 
 ### 6.8 `memory.py` — 记忆子系统(2026-09-06 设计定型)
 
@@ -406,8 +468,8 @@ len(messages) > MAX_MESSAGES 时:
 **读写路径(模型自主调用)**
 
 - `write_memory(memory, title?, tags?, source="manual")`:生成唯一 id(`exp-YYYY-MM-DD-HHMMSSffffff`)落盘 + 写 index;title/tags 缺省时从正文自动提取。工具入口 `create_handlers()` 暴露为 **`write_memory` 工具**,模型自主决定何时调用;
-- `recall_memory(query?)`:取全部标签作提示,起一个**子 agent**,让它按标签 `read_file` 检索后返回最相关记忆;`allow_recall_memory=False` 时方法内守卫直接返回「子 agent 禁止召回」指引;
-- 布尔开关:`allow_write_memory` / `allow_recall_memory` / `allow_subagent`。主 agent 全开;**子 agent 实例化即全 False**(防递归 + 防污染共享库),被禁工具注册"守卫桩",返回指引而非裸报错。
+- `recall_memory(query?)`:取全部标签作提示,起一个**子 agent**,让它按标签 `read_file` 检索后返回最相关记忆。它自己身上**没有**身份检查 —— 拦住它的是链条的下一环:它转调 `run_subagent`,而那里第一句就是 `if self.role != ROLE_MAIN` 直接拒绝(`claude.py:745`);
+- **这三个工具归谁由 `role` 定**(§6.3):`write_memory` / `recall_memory` / `subagent` 都在 `ROLE_SUBAGENT` 与 `ROLE_MEMBER` 的禁用表里,只有主 agent 有。被禁的工具**不注册也不进工具表**,而不是注册成守卫桩再返回指引 —— 那会留下一个「模型看得见、却永远失败」的名字。
 
 **为什么去掉「每轮提取」**
 
@@ -461,11 +523,11 @@ main.py ──┬─ Scheduler.start()   每分钟 tick() ──▶ queue(内存
 |---|---|
 | `corn_job.py` | `Job`(:42)、`Scheduler`(:158)、5 个状态常量与 `JOB_TRANSITIONS`(:16-29) |
 | `agent_runner.py` | `AgentRunner`(:20);`POLL_INTERVAL_SECONDS=5` / `WAKE_COOLDOWN_SECONDS=60`(`:5-9`) |
-| `claude.py:62-67` | 注入 `Scheduler` 并 `start()`;主/子 agent 共享同一实例 |
-| `claude.py:69-76` | **注册 7 个 `job_*` 工具**(启用时注册 `self.job_*` 方法,禁用时注册守卫桩) |
-| `claude.py:275-345` | **7 个 `job_*` 方法实现 + `_job_guard` / `_memory_guard` 守卫桩工厂**(同 `subagent`/`load_skill` 的规矩:Schema 在 `TOOLS.py`,实现是类方法) |
-| `claude.py:27-35` | 系统提示词注入「当前时间」(模型得知道今天几号才能把「明天下午3点」算成 `once_at`) |
-| `TOOLS.py` | 7 个 `job_*` 的 Schema 声明(只声明,不含处理逻辑) |
+| `claude.py:104-105` | 注入 `Scheduler` 并 `start()`;主/子 agent 共享同一实例 |
+| `claude.py:143`、`:150-152` | **注册 7 个 `job_*` 工具**:`native_handlers` 表里 `**{name: getattr(self, name) for name in JOB_TOOLS}`,再按身份过滤注册 —— 子 agent 的 `role` 把这些名字禁掉了,所以对它是**不注册**(没有守卫桩) |
+| `claude.py:905-961` | **7 个 `job_*` 方法实现**(同 `subagent`/`load_skill` 的规矩:Schema 在 `TOOLS.py`,实现是类方法;`__init__` 只负责注册) |
+| `claude.py:78-79` | 系统提示词注入「当前时间」(模型得知道今天几号才能把「明天下午3点」算成 `once_at`) |
+| `TOOLS.py:169-283` | 7 个 `job_*` 的 Schema 声明(只声明,不含处理逻辑);`TOOLS.py:450` 的 `JOB_TOOLS` 是「这 7 个」的唯一定义处,子 agent / 成员的禁用表复用它 |
 | `PROMPT.py:16-45` | 「定时任务」使用规范:创建 / 管理 / 执行三段 |
 | `.task/jobs.json` | 任务库(跨会话保留);队列 `queue` 是**派生状态,不落盘** |
 
@@ -557,11 +619,13 @@ if any(j.id == job.id for j in self.queue): continue   # 已派发但没被取�
 
 **与子 agent 的边界**
 
-子 agent 实例化时 `allow_jobs=False`,`claude.py:69-76` 把 7 个 `job_*` 工具**全部注册成守卫桩**,返回一句指引而不是裸报错(与 memory 工具同样的做法):
+子 agent 的 `role` 是 `ROLE_SUBAGENT`,7 个 `job_*` **全在它的禁用表里**(`TOOLS.py:466`),所以这些工具对它**整个不存在**——不注册、不进工具表(§6.3)。以前的做法是把它们注册成守卫桩、返回一句指引:
 
 > ❌ 子agent禁止调用 job_create(定时任务统一由主agent管理,避免重复创建/重复执行)。
 
-原因:定时任务库是主/子共享的**唯一**一份,子 agent 若能创建,「一次性任务」就会被子 agent 各自重复创建;而 `job_take` 更是必须集中在主 agent——否则同一个任务会被领两次。守卫桩用 `lambda *a, **kw` 写,兼容位置/关键字两种调用方式。
+那句话现在已经不会出现了(桩已删),但它记的是**为什么**要禁。理由没变,变的只是拦法:以前是运行到那一步、从桩的返回值里知道被禁,现在工具压根不在表里。
+
+原因:定时任务库是主/子共享的**唯一**一份,子 agent 若能创建,「一次性任务」就会被子 agent 各自重复创建;而 `job_take` 更是必须集中在主 agent——否则同一个任务会被领两次。这个理由现在直接体现在禁用表里:7 个名字都写在 `ROLE_SUBAGENT` 的禁用集合中。
 
 **已知边界**
 
@@ -654,6 +718,251 @@ s.tick(datetime(2026, 9, 15, 10, 0))               # → 打印补跑日志 + �
 
 > 前台 `bash` 与后台 `bash` 走的是**同一个** `execute_bash`,区别只在「谁来等」——前台是主循环等,后台是一条 daemon 线程等。这也是为什么 `bash` 的 Schema 只需要多一个 `is_background` 布尔位。
 
+### 6.12 `message.py` + `team.py` — Agent 团队(2026-09-17)
+
+**定位:让多个 agent 常驻并行、互相通信。**
+
+先说清它和 subagent 的分工,这是整套设计的前提:
+
+| | subagent | 团队成员 |
+|---|---|---|
+| 生命周期 | **一次性**:派活 → 阻塞等结果 → 用完即销毁 | **常驻**:启动后一直活着,没事时 idle 阻塞,收到消息才工作 |
+| 谁等谁 | 主 agent **阻塞**等它跑完 | `team_spawn` **立刻返回**,成员完成后主动发消息回来 |
+| 通信 | 只有一次返回值 | 双向、多轮,成员之间也能直接对话 |
+| 适合 | 有明确结果、一次就能干完的独立子任务 | 需要长期协作、来回多轮沟通,或并行推进多件互不依赖的事 |
+| 实现 | `run_subagent` 里 `new ClaudeMini(...)` + `run()` | `run_forever()` + 一条 daemon 线程 |
+
+**三个角色,职责边界划得很硬**
+
+| 角色 | 代码 | 只做什么 |
+|---|---|---|
+| **消息总线** | `MessageBus`(message.py) | 存消息、转发消息。**不认识消息类型**,按调用方给的 predicate 筛 |
+| **成员表** | `TeamRuntime`(team.py) | 成员是谁(ID)、现在什么状态。**写权限只属于主 agent** |
+| **成员生命周期** | `ClaudeMini.run_forever`(claude.py) | 一个成员线程的 idle → work → idle 循环,直到下线确认 |
+
+总线是**纯基础设施**:`Message` 上虽然带着 `kind` 字段,但「哪种 kind 算控制消息」是 `team.py` 里的 `is_chat` / `is_control` 两个 predicate 定义的,由调用方传给总线。这样总线本身不必知道「下线请求」是什么东西(设计上的一条硬边界)。
+
+**MessageBus 的三种读法**——这是为「主 agent 和成员处境不同」而生的:
+
+| 方法 | 行为 | 谁用 |
+|---|---|---|
+| `receive(receiver)` | **阻塞**等到有消息为止(挂在 `Condition` 上,0 CPU) | 团队成员。它等得起 |
+| `drain(receiver, predicate)` | 非阻塞,取走全部符合的消息 | 主 agent。它卡不起 |
+| `has_message` / `count` | **只看不取** | 主 agent 的探针 / 成员判断「还有没有活没干」 |
+
+主 agent 的处境是这套设计的起点:**它被 `input()` 驱动**。如果让主 agent 也去阻塞等消息,用户就没法打字了。所以 `main.py` 的输入循环用 `inbox.get(timeout=1)`——**超时的那一秒不是白等的**,那一趟用来 `process_control_messages()`(纯代码推进下线握手,不叫模型)并看一眼 `has_team_message()`(有普通消息就把 agent 叫起来跑一轮)。这样「用户敲键盘」和「成员发消息」两条唤醒来源就合到了一个循环里,不必给主 agent 单开一条线程。
+
+**身份是 ID,不是名字**(`team.py`)
+
+- 成员 ID 形如 `alice-7f3a`:`名字` + `secrets.token_hex(2)`;
+- **唯一,而且成员下线后不回收** —— 新的同名成员一定拿到不同的 ID,所以不会出现「旧成员的历史消息被新成员继承」;
+- 名字**允许重复**(只用于展示和模型理解),所以寻址一律用 ID。`resolve_member` 的规则是:完整 ID 优先;名字只在**团队里唯一**时才接受,重名会返回一句「请改用 ID 指定:...」,把候选列给模型看;
+- 主 agent **不是成员**,但它永远可寻址(`is_owner` / `owner_id`)。
+
+**四种逻辑状态**(`team.py`),关键是**必须区分「Main 希望它退出」和「它的线程实际上已经退出」**:
+
+| 状态 | 含义 |
+|---|---|
+| `alive` | 在岗:运行中或 idle 等消息 |
+| `exiting` | **已收到下线请求,等它最终确认 + 真的停下来** |
+| `offline` | 已经退出:确认过,且线程确实停了 |
+| `dead` | 异常死亡:线程没了,但没走下线协议 |
+
+成员还有一个 `self_state`(`idle` / `work` / `exit`)——**那是成员自己报的执行状态,只用于展示**。线程里的事只有成员自己知道,主 agent 不去猜:所以 `Member` 上 `status`(逻辑状态,主 agent 维护)和 `thread_alive()`(物理事实)是分开的两个东西,由对账来拉齐。
+
+**控制面与数据面**(这是整个子系统的骨架)
+
+```python
+if is_control(msg):
+    self._handle_control(msg)      # 代码处理,绝不进 LLM
+    continue
+# 数据面:普通消息包成 user 输入,交给 run() 跑一整个工作期
+self.run(team_history)
+```
+
+- **数据面**:普通消息(`kind="chat"`)拼成 `<team_message sender="alice-7f3a">...</team_message>` 进 history,交给模型;
+- **控制面**:生命周期消息(`offline_req` / `offline_agree` / `offline_refuse`)由代码处理,**一个 token 都不进 LLM**。不用 `content == "/exit"` 这种字符串约定来判断生命周期——那是给未来埋雷。
+
+判据用**代码能确定的确定性事实**(成员是否存在、有没有待处理消息、线程是否存活),只有「这份工作是不是还需要我」这种业务判断才问模型。这条分工贯穿整个下线流程。
+
+**下线握手:四步,方向固定**
+
+```
+主agent                          成员
+  │ team_stop(member)              │
+  ├─ ① 登记看门狗                  │
+  ├─ ② 状态置 exiting              │
+  ├─ ③ 发 offline_req ────────────▶│
+  │                               ├─ ④ 最终确认 _confirm_offline
+  │                               │     a. 收件箱还有普通消息 → 直接拒绝(不用问模型)
+  │                               │     b. 否则注入 OFFLINE_CONFIRM_PROMPT 跑一轮
+  │                               │        (模型调 team_offline_confirm 给结论)
+  │                               │     c. 模型没给明确结论 → 保守:拒绝下线
+  │                               │        (绝不能无条件退出)
+  │                               │     d. 同意了但确认期间又来新消息 → 撤回同意
+  │◀──── offline_agree/refuse ────┤  _reply_offline:先发消息,再置 running=False
+  ├─ ⑤ _on_offline_reply          │
+```
+
+顺序上有个**必须**记住的点(`_reply_offline`):**同意时先回消息、再让自己的循环停下来**。反过来的话,主 agent 可能先看到线程停了、却还没收到确认消息 —— 于是把一个正常下线的成员判成异常死亡。
+
+主 agent 侧(`_on_offline_reply`)也是同理:收到 **agree** 之后不能立刻宣布「已下线」,要 `thread.join(timeout=5)` 确认线程真的停了,才把状态置 `offline`。**状态要建立在事实之上。**
+
+**看门狗:等待必须有上限**
+
+这是**压测逼出来的补丁**,也是本子系统里最有取舍味道的一段。原始的握手没有上限:成员不回话,主 agent 就永远停在 `exiting`——压测里成员线程崩掉后,主 agent 空等着**整整 13 分钟没人发现**。
+
+但「没回话」不等于「它死了」,所以分两步走(`OFFLINE_ACK_TIMEOUT_SECONDS = 120` / `OFFLINE_MAX_ROUNDS = 2`):到点先**查状态**,再决定重发还是判定失灵。
+
+```
+到点了,看这个成员:
+├─ 状态已经不是 exiting     → 握手早结束了,撤记录(兜底清场)
+├─ 线程已经没了
+│   ├─ 根本没有线程(幽灵)   → 标 dead + 通知模型(它永远不可能回话)
+│   └─ 线程刚停             → 不抢 reconcile 的活,让它去判
+├─ 这是最后一轮             → _give_up_on_member:标 dead + 通知模型
+└─ 还有轮次
+    ├─ 它自报 exit          → 已经同意、正在收尾,回信马上就到,撤记录
+    ├─ 它自报 idle          → 手上没活却没回应,消息大概率没被处理 → **重发一次**
+    └─ 它自报 work          → **不重发**,只续期
+```
+
+两个设计细节:
+
+- **存的是绝对时刻,不是倒计时**(`deadline: time.monotonic() + 120`)。检查来晚了(主 agent 正卡在一次长工具调用里)也不会把窗口越推越长。倒计时会在「每次都迟到一点点」时无限续命;
+- **重发的前提是成员空闲**。它在 `work` 说明正在干活(很可能**正是在做下线确认**),重发会让它把同一件事干两遍 —— 成员侧靠 `kind` 触发、不看内容,**没法去重**。所以只有第一轮的 `idle` 会走到重发,重发最多一次。
+
+判定失灵(`_give_up_on_member`)的文案要说清两件事:它没做完的活**没有人接手**;而它的线程可能还活着(Python 杀不掉线程)——所以 `dead` 在这里的意思是「这个成员不再可信、不再被管理」,不是「进程没了」。万一它只是慢、稍后补上回信,状态会被自动纠正。
+
+**对账顺序:先取消息,再对账**
+
+`_reconcile_team` 用线程事实给逻辑状态对账:状态还写着在岗、线程却已经没了 → 改成 `dead` 并通知模型。
+
+但这里藏着一个**顺序陷阱**:按协议下线的成员是「**先发确认消息、再停线程**」,所以在确认消息被取走之前,它和异常死亡**长得一模一样**。因此必须**先 drain 控制消息、再 reconcile**。
+
+这个坑不是推理出来的,是实测踩到的:成员已正常同意下线,却被报成「dead / 线程异常终止」。修法还多走了一步——`_reconcile_team` **自己**先把控制消息处理掉,而不是指望调用方保证顺序。因为 `team_list` 是模型随时可能调的工具,它也会走到这里,而那一刻主循环根本没轮到取消息。
+
+**通知与「必须专门叫一趟」**
+
+成员上下线以 `<team_notice>` 的形式送到模型面前。通知上带一个 `urgent` 标记:
+
+- 普通通知(如「某某已下线」)**搭车**送——下一条团队消息进来时一并捎过去,不为此单独叫模型;
+- `urgent=True` 的通知(成员**失灵**、线程**意外终止**)会**专门叫一趟**:`has_team_message()` 见到 urgent 就直接返回 True。理由是——成员出问题时往往**没有别人再发消息了**,只搭车就等于永远送不到。压测里主 agent 就是这样静默停住的。
+
+标记记在**通知自己身上**,不在别处另存一个标志位:两者就不可能跑到不同步(一旦错开,主循环会每秒都以为有事、每秒叫一次模型)。
+
+**两道针对模型行为的补丁**
+
+团队是本项目里第一个「模型的行为会真的破坏机制」的地方,所以有两处修法不在代码逻辑里,而在**怎么跟模型说话**:
+
+1. **客套风暴**。最初 `run_forever` 给成员的消息包装里写的是「如需回复对方,调用 `send_message`」—— 那是在**邀请**回复。实测后果:共识达成后成员之间又刷了 **53 条**消息(38 条成员↔成员),其中 42 条短于 25 字,最后十条是「喵~ 🐱」来回发,靠某次调用碰巧没调工具才停下。改法是把默认动作反过来:**「只有你确实有新的实质信息要告诉对方、或对方问了需要你回答的问题时才回;只是收到/同意/感谢这类客套话不要回 —— 你回一句它再回一句,会没完没了」**。同一段话在 `TEAM_MEMBER_PROMPT` 里又写了一遍,并且加了一句「事情谈完了、你无话可说时**就不要再回** —— 停在这里不是失礼,是让对方也能停下来」。
+2. **谎报身份与结果**。成员看到的是主 agent 的系统提示词,它会以为自己能建团队(其实它连这个工具都没有),甚至**谎报「已启动成员」**。修法是给成员追加一份 `TEAM_MEMBER_PROMPT`(§6.7):不能建团队、不能起 subagent、干完活不自己退出、**工具返回什么就如实说**。
+
+**守卫与共享**
+
+成员实例化时只给一个身份(`team_spawn` 里那一行,`claude.py:402-405`):`role=ROLE_MEMBER`。这一个参数换算出 12 个禁用工具(§6.3)——`team_spawn` / `team_stop` 防无限扩张,`subagent` / `write_memory` / `recall_memory` 防递归和污染共享记忆库,7 个 `job_*` 防同一个定时任务被领两次。被禁的工具**不存在**:不注册、不进工具表,模型看不到,运行时也调不动。
+
+共享的是那一串**不可复制**的实例:`message_bus` / `team_runtime` / `task_store` / `scheduler` / `mcp`(§3.1 的共享实例清单)。成员的 `system_prompt` 是自己拼的,但**成员表只有一份、总线只有一条**。
+
+**已知边界**
+
+- **`DEAD` 的成员只是「不再被管理」**,线程可能还在跑(Python 没有安全的杀线程手段)。它没做完的活不会有人接手;
+- **成员之间直接通信是有意的**(`send_message` 不经过主 agent),代价是主 agent 未必知道他们谈了什么 —— 需要主 agent 知情时靠提示词要求成员汇报;
+- **`run_forever` 用一份独立的 `_team_history`**,与主 agent 和用户的对话完全隔离;
+- 团队规模**没有硬上限**,只有「成员不能再建成员」这一道(`ROLE_MEMBER` 的禁用表里禁了 `team_spawn`,§6.3)。主 agent 一口气 spawn 很多个成员在代码上是允许的。
+
+### 6.13 `mcp.py` — MCP(Model Context Protocol)接入(2026-09-18)
+
+**定位:让工具来源超出本项目自己的代码。**
+
+MCP 干的事一句话:**让外部进程能给模型提供工具。**
+
+```
+模型  ←→  mcp.py(MCPClient)  ←→  MCP 服务器(另一个进程)
+```
+
+**协议与传输**
+
+说的是 **JSON-RPC 2.0**:一行一条 JSON,一问一答。带 `id` 的是请求(对方要回),不带 `id` 的叫通知(没人回)。一次握手长这样:
+
+```
+客户端 → initialize                      「我是谁、我支持哪个协议版本」
+服务器 → {protocolVersion, serverInfo}    「我用这个版本」
+客户端 → notifications/initialized        通知,不等回应
+客户端 → tools/list                      「你有哪些工具?」
+服务器 → {tools: [{name, description, inputSchema}, ...]}
+客户端 → tools/call                      「帮我调 echo,参数是...」
+服务器 → {content: [{type:"text", text:"..."}], isError: false}
+```
+
+传输方式只实现了 **stdio**:把服务器当子进程拉起来,消息从它的 stdin 进去、从它的 stdout 出来。HTTP 传输要在 `connect` 里显式拒绝并说明原因 —— 那需要真有一台远程服务器在跑,本项目没有。
+
+**stdio 有一条铁规矩,踩了当场就崩:服务器的 stdout 只跑协议,一个字节别的都不能有。** 它想打日志必须写 stderr —— 往 stdout 多打一行「正在启动...」,客户端就会拿这行去 `json.loads`。随附的 `mcp_demo_server.py` 就是这么写的(它所有 `print` 都带 `file=sys.stderr`)。
+
+**为什么要一条读线程**(`_pump`)
+
+Windows 的管道**不支持 `select`**,没有「带超时地读一行」这种调用 —— 就地读的话,一旦服务器不回话,我们就永远卡住。所以把读 stdout 的事交给一条 daemon 线程,它把解析好的消息丢进 `queue.Queue`;超时由调用方那个 `get(timeout=...)` 负责。
+
+读线程还顺手兜住两种脏数据:空白行跳过;**不是 JSON 的行打个招呼丢掉**(比如服务器忘了规矩往 stdout 打了日志)。一行意外输出不该把整个客户端带崩。
+
+**为什么请求要串行**(`_request` 全程持锁)
+
+锁不是可有可无的:**团队成员各在自己的线程里跑,而它们共享同一个 client**。不加锁的话两条请求会同时在管道上跑,各自的 `_read` 会把对方的回应吃掉(协议上只认「下一条不是 method 的消息」),谁拿到谁的纯凭运气。
+
+这一点是**实测**过的:8 条线程 × 每条 40 次并发调用同一个 client,**加锁 0 次串味;把锁换成 `nullcontext` 后串味 250 次**。
+
+两个协议层的细节:
+
+- **回应归属用 `method` 判断,不用 `id`**:带 `method` 的消息是服务器主动发来的(通知或反向请求),不是对我们这条的回应。判据必须是 `method` —— `id` 是两边**各自编号**的,可能撞车;
+- **服务器反向请求必须回一条 error**(`_answer_server`):没有 `id` 的是通知,忽略即可;有 `id` 的是服务器在请求我们(比如 sampling:让客户端帮忙跑一次模型)。我们不支持,但**必须回一个 error** —— 不回它就一直挂在那儿等,后面我们自己的请求也可能跟着被堵住。
+
+**工具怎么并进本项目的工具表**
+
+两件事缺一不可:注册处理函数(**调得动**)+ schema 进 `self.tools`(**模型看得见**)。只做前一半,模型不知道有这个工具;只做后一半,模型一调就是 `Unknown tool`。
+
+`MCPManager.collect()` 保证两者**永远是同一个集合** —— 它一次产出 `(schemas, handlers)`,不会出现「注册了却没说」或「说了却调不动」。
+
+**撞名的处理是「整个丢掉」**(`collect` 的 `reserved` 参数):已经被原生工具占掉的名字,直接跳过。宁可少一个工具,也不能让 MCP 悄悄顶替原生工具 —— registry 是字典,**后注册的会把先注册的顶掉**,模型看到的名字没变、行为却变了,这种问题极难排查。两个 MCP 服务器之间撞名同理。
+
+**前缀不只是防撞名,还是安全措施**:默认前缀是「服务器名`__`」。没有前缀的话,服务器只要提供一个**叫 `bash` 的工具**,就绕开了 `PERMISSIONS` 里对 bash 的检查 —— 那套检查是按工具名精确匹配的(见 `PERMISSIONS.check_permission`)。
+
+**参数校验前移到客户端**(`make_handlers`):未知参数、缺必填参数都在本地就挡下,不发给服务器。原因是 `handler(**kwargs)` **收得下任何关键字**,写错名字不会抛 `TypeError`,会一路原样发给服务器、那边 `args["a"]` 抛个 `KeyError`,最后模型看到的是「KeyError: 'a'」—— 它得自己去猜参数该叫什么。在这里挡住,就能像本项目其它工具一样把正确参数名报给它(和 `_call_tool` 的做法一致),还省一个来回。
+
+**配置与降级**(`mcp_servers.json`)
+
+| 字段 | 说明 |
+|---|---|
+| `command` | 服务器命令。**不写 = 用当前这个 Python 解释器** —— 写死 `"python"` 可能撞上 PATH 里另一个版本 |
+| `args` | 参数列表 |
+| `cwd` | 工作目录。**不写 = 配置文件所在目录**,这样 `args` 里写相对路径就不用管 agent 是从哪个目录启动的 |
+| `env` | 额外环境变量,**叠加**在现有环境之上(替换会把 `PATH` 之类的整个抹掉,子进程连解释器都找不到) |
+| `prefix` | 工具名前缀,不写 = `"服务器名__"` |
+| `timeout` | 单次请求等的秒数 |
+| `enabled` | 设 `false` 可临时关掉(`load` 里第一个判断,连都不会去连) |
+
+注意前缀的边界:**顶层**可以放 `_说明` 这类给人看的键(`load` 只取 `raw["servers"]`,其余一概不看,仓库里那份配置就是这么写的);但 **`servers` 里面的每个键都会被当成一个服务器名** —— 在那儿写 `_说明`,程序会拿这段说明去当服务器启动。
+
+**「连不上只该是少几个工具」是一条不许失败的边界**:`load()` 里那个 `except` 故意抓得很宽、而且不重新抛出。要抓的远不止 `MCPError` —— `Popen` 在 command 不存在时抛的是 `FileNotFoundError`/`OSError`(不是 `MCPError`),漏掉它就等于**一个配错的服务器名字把整个程序拦在启动阶段**。这正是实测踩到的。所以配置文件不存在、配置不是 JSON、`servers` 类型不对、服务器启动就崩 —— 全都不阻断 agent 启动,只记进 `self.failed` 并打一行日志。
+
+**子进程收尾**:Python 退出**不会顺手杀子进程**,不收它们会挂在后台一直等 stdin。所以 `MCPManager.__init__` 里挂了 `atexit` 兜底,`main.py` 结尾又显式 `claude_mini.mcp.close()` 一次(正常退出就干净,不指望兜底)。`close()` 可重复调用。
+
+**自带的演示服务器**(`mcp_demo_server.py`)
+
+三个工具:`echo`(回显,确认链路通)、`add`(算两数之和)、`now`(返回**服务器那台机器**上的当前时间 —— 这个时刻只有服务器知道,用它验证工具真的跑在另一个进程里)。
+
+两个值得看的实现细节:
+
+- **stdin/stdout 显式锁成 UTF-8**。MCP 的 stdio 传输按规范就是 UTF-8,而 Windows 上被重定向的 stdout 默认走系统 ANSI 代码页(中文机器是 GBK),不锁的话中文会以 GBK 发出去、客户端按 UTF-8 解,直接乱码。**注意这跟「改 agent 控制台的输出编码」是两回事**:这里是一条协议管道,不是给人看的终端;
+- **工具执行失败走的是 `result` 里带 `isError`,不是 JSON-RPC 的 `error`**。两者的区别是「协议层出错」和「工具本身出错」—— 后者模型看得见、可以自己改参数重试。
+
+> 这个文件**刻意不入库**(`.gitignore` 里没有它,是当初提交时刻意没 `add`):它是本机自用的测试脚手架。连带后果是 **`mcp_servers.json` 在 clone 出来的仓库里是悬空的** —— 它指着这个不存在的文件。这不会出事:`MCPManager` 找不到/连不上时静默降级成 0 个 MCP 工具,agent 照常启动(已实测)。
+
+**已知边界**
+
+- **只支持 stdio**,不支持 HTTP/SSE 传输;也没有重连机制 —— 服务器中途挂了,后续调用直接报 `MCPError`;
+- **一次只发一个请求**:`_request` 全程持锁。够用(MCP 本来就是一问一答的顺序协议),但一个慢工具会挡住所有 agent;
+- **不支持服务器反向请求**(sampling / roots),只回 error。图片、内嵌资源类型的内容也只报个占位符,不展示。
+
 ---
 
 ## 7. 特点与设计亮点
@@ -666,11 +975,17 @@ s.tick(datetime(2026, 9, 15, 10, 0))               # → 打印补跑日志 + �
 6. **后台任务的通知是「下一轮的一条 user 消息」,不是中断**——`bash` 带 `is_background` 就起线程立刻返回,结果在下一轮循环开头以 `<task_notification>` 注入。没有回调、没有事件循环,主循环的同步结构一点没被破坏(§6.11)。
 7. **子 agent 递归 + 提示词约束「验证子 agent 结果」**——没有引入复杂框架,用纯提示词规则约束分层。
 8. **Skill 按需加载 + 自研目录扫描器**——零依赖实现,兼容 `name:/description:` 纯文本与 YAML 两种前言。
-9. **全模块低耦合、单文件职责清晰**——15 个文件、十几个模块,任何一个机制都可以单独读懂、单独拆改;
-10. **错误处理风格友好**——大量 `try/except` 返回带 emoji 的中文错误字符串而不是抛异常,适合教学演示;这条风格也贯彻到了「子 agent 用了被禁工具」的场景:注册守卫桩返回指引,而不是让它撞上 `Unknown tool`(§4.2);
+9. **全模块低耦合、单文件职责清晰**——18 个文件、二十来个模块,任何一个机制都可以单独读懂、单独拆改;
+10. **错误处理风格友好**——大量 `try/except` 返回带 emoji 的中文错误字符串而不是抛异常,适合教学演示。不过「子 agent 用了被禁工具」这一处**刻意不走这条路**:早先是注册守卫桩返回一句指引,现在改成**工具整个不给**(不注册、不进工具表),配上按身份说一遍的 `ROLE_HINT`(§6.3)。理由是那道指引根本够不着——模型看不见的工具它不会去调,也就永远看不到那句提示;
 11. **记忆即行为**——长期记忆不靠定时提取,而是把 `write_memory` / `recall_memory` 作为工具交给模型**自主调度**;去重整理交给「会话结束 + LLM 判断 + 快照先行」,机制简约且可回滚。
 12. **定时任务:判「欠不欠一次执行」而不是「此刻是否匹配」**——用 `next_run` 这一个指针取代「cron 匹配 + `last_run` 去重」,进程没运行的那段时间不再把任务静默丢掉;而「崩溃重启后能续上」「同一分钟不重复派发」「停跑三天只补一次」这三个性质,都是同一个机制的自然结果,没有额外的分支(§6.9)。
 13. **状态机的两道守卫**——流转表管「能不能变」,方法级白名单(`JOB_REPORTABLE` / `resume_job` 的状态检查)管「准不准从这条路走」。因为 `completed/failed → pending` 这条边**必须**留给调度器开新一轮,只靠一张流转表挡不住「模型把跑完的任务复活」。
+14. **控制面与数据面严格分开**——团队成员的生命周期消息(下线请求/确认/拒绝)由代码处理,**一个 token 都不进 LLM**。判断「该不该下线」这种业务问题才问模型;而「收件箱里还有没有没处理的消息」「线程还活着吗」这类**确定性事实一律在代码里查**,不交给模型猜(§6.12)。
+15. **等待必须有上限,但「没回话」不等于「死了」**——下线握手先补了看门狗(否则主 agent 会永远停在 `exiting`,压测里空等 13 分钟没人发现),再区分「空闲却没回应(重发一次)」和「正在干活(只续期,免得让它把同一件事干两遍)」。用**绝对时刻**而不是倒计时,检查迟到也不会把窗口越推越长(§6.12)。
+16. **状态建立在事实之上**——收到「同意下线」的回信也不立刻改状态,要等线程真的停了才置 `offline`;反过来,按协议下线的成员**必须先取走它的确认消息、再对账**,否则它和「异常死亡」长得一模一样。这个顺序陷阱是实测踩出来的(§6.12)。
+17. **必须让模型知道的事,要有办法穿过「搭车」**——成员失灵这类通知自带 `urgent` 标记并**专门叫一趟**模型:那时候往往没有别人再发消息了,搭车就等于永远送不到。标记记在通知自己身上,不在别处另存标志位,两者就不可能不同步(§6.12)。
+18. **工具来源可以超出自己的代码,但绝不能悄悄顶替**——MCP 工具统一加「服务器名`__`」前缀(顺带堵住了「服务器提供一个叫 `bash` 的工具就绕开 `PERMISSIONS`」);和原生工具撞名的**整个丢掉**,因为 registry 是字典,后注册的会顶掉先注册的而模型看不出来。同理,「连不上 MCP」被明确划成**不许失败的边界**:只该少几个工具,绝不能挡住 agent 启动(§6.13)。
+19. **「模型的行为会破坏机制」要当成一类问题来修**——团队子系统里有两处修法不在代码逻辑里,而在怎么跟模型说话:把「收到请回复」的默认动作反成「没有新的实质信息就不要回」(实测:不反的话成员之间会刷 53 条,最后是「喵~ 🐱」来回发),以及给成员单独一份提示词说明它**不是**主 agent(否则它会谎报「已启动成员」)(§6.12)。
 
 ---
 
@@ -695,9 +1010,9 @@ L4 一旦触发,会把 history **整个替换成**「摘要 + 归档路径」,�
 
 ### 8.3 中
 
-- **`.env` 里明文存了真实 API Key**,且项目未初始化 git/gitignore——不要把 `.env` 提交到仓库(见 §10);
+- **`.env` 里明文存了真实 API Key**。仓库已初始化并配好 `.gitignore`(`.env` / `.env.*` / `tool_result/` 永久挡住,见 §10.3),**这挡的只是「以后不进库」**——历史里有没有、以及密钥该不该轮换,是另一件事:曾用过的那把 MiniMax `sk-cp-` 密钥在 `tool_result/` 的缓存里存过明文,缓存目录现已不入库;**轮换密钥只有本人能做**;
 - `calculator` 用 `eval`,任意表达式都能执行,无沙箱;
-- 任务规划:`TaskStore` **没有加锁**,也没像 `Scheduler` 那样被共享进子 agent 之外的线程。当前只有主线程会写它(子 agent 虽共享同一 store,但也是同步调用),所以没暴露问题;一旦将来有第二条线程碰任务库,就得补锁;
+- 任务规划:`TaskStore` **没有加锁**,也没像 `Scheduler` 那样被共享进子 agent 之外的线程。当前只有主线程会写它(子 agent 虽共享同一 store,但也是同步调用),所以没暴露问题;**但团队成员已经是有自己线程的写者了** —— 一旦成员也用 `task_*` 工具(它们目前**没有**被禁用),第二条线程碰任务库就是现实场景,这把锁该补了(§6.12、§11);
 - 记忆:记忆工具对模型**可见即可用**,没有兜底提取/自动去重,召回与整理都依赖模型自主(设计取舍,非缺陷);
 - 记忆:`recall_memory` 的子 agent 按**硬编码相对路径**检索 index,若 `MEMORY_DIR` 被重定向则召回与写入分叉(见 §6.8 遗留);`search_by_tags` 暂无调用方。
 
@@ -715,6 +1030,29 @@ L4 一旦触发,会把 history **整个替换成**「摘要 + 归档路径」,�
 - **启动积压**:进程停跑期间欠了 N 个任务,启动后首轮扫描会一次性全部入队(N 行补跑日志),agent 一个一个领;这是「补一次、不做窗口」的必然结果;
 - **补跑只打日志**:没有「这次是补跑 / 原定何时」的结构化字段,日后若要统计迟到率得再加字段。
 
+### 8.6 中:团队的已知边界(设计取舍与真问题混在一起,分开列)
+
+**真问题(该修的)**:
+
+- **`TaskStore` 没有锁,而团队成员现在是并发的写者。** 成员的禁用表里禁掉了子 agent / 写记忆 / recall / 定时任务,但 **5 个 `task_*` 一个都没禁,整套都注册着**,而它们共享同一个 `task_store`。每个成员跑在自己的线程里 —— 也就是说「第二条线程碰任务库」这个前提**已经成立了**,只是还没被踩到。补锁这件事从「将来」变成了「现在」(§8.3、§11);
+- **成员之间直接通信,主 agent 不一定知情。** `send_message` 不经过主 agent,成员可以私下协商。需要主 agent 掌握全局时,只能靠提示词要求成员汇报(§6.12);
+- **`DEAD` 的成员线程可能还活着。** Python 没有安全的杀线程手段,所以 `dead` 的含义只是「不再可信、不再被管理」;它没做完的活**没有人接手**;
+- **团队规模没有硬上限。** 只有「成员不能再建成员」这一道(成员身份禁了 `team_spawn`,§6.3)。主 agent 一口气 spawn 很多个成员在代码上是允许的,唯一的经济约束是提示词里那句「不要为此建团队」。
+
+**设计取舍(不算缺陷)**:
+
+- **只有成员能主动阻塞等消息**:主 agent 走的是「1 秒超时 + 探针」,所以用户没输入时,主 agent 处理团队消息**最多有 1 秒延迟**(`main.py` 的 `inbox.get(timeout=1)`)。这是「不接管控制台」的必然代价;
+- **下线握手是双向的,因此慢**:成员在 `work` 时不重发,最坏情况要等满 2 × 120 秒才判定失灵;
+- **看门狗靠主循环的 1 秒节拍推进**:`_check_offline_timeouts` 是在 `_reconcile_team` 里被调的,而主 agent 的 `process_control_messages()` 每秒都会走到那里 —— 所以**不需要用户输入**也会推进(`main.py` 的 `inbox.get(timeout=1)` 那一趟就干这个)。代价是主 agent 的 `run()` 若卡在一次长工具调用里,节拍会跟着停 —— 这也是 `deadline` 存**绝对时刻**而不是倒计时的原因:迟到的那次检查不会把窗口重新推长。
+
+### 8.7 中/低:MCP 的已知边界
+
+- **只支持 stdio**,不支持 HTTP/SSE;也**没有重连**:服务器中途挂掉后,后续调用直接抛 `MCPError`,不会自动拉起来;
+- **一次只发一个请求**(`_request` 全程持锁)。一个慢工具会挡住所有 agent —— 包括团队成员;
+- **不支持服务器反向请求**(sampling / roots),只回一条 error。图片、内嵌资源类型的内容也不展示,只报类型占位符;
+- **服务器崩了不会通知模型**:工具调用会返回一条错误字符串,但没有任何「这个服务器已经不可用」的主动告知(和「后台任务失败也只在输出里体现」是同一类缺口);
+- **`mcp_servers.json` 已入库,而它指向的 `mcp_demo_server.py` 刻意不入库** —— 在 clone 出来的仓库里这份配置是悬空的。行为上安全(静默降级成 0 个工具),但会让人困惑:改法要么把 demo server 也入库,要么把这份配置从仓库里去掉(见 §11)。
+
 ---
 
 ## 9. 如何运行
@@ -723,7 +1061,7 @@ L4 一旦触发,会把 history **整个替换成**「摘要 + 归档路径」,�
 # 1. 安装依赖
 pip install anthropic python-dotenv
 
-# 2. 准备 .env(参考 §10)
+# 2. 准备 .env(参考 §10.1)
 # 3. 运行
 python main.py
 ```
@@ -739,10 +1077,20 @@ python main.py
 > 想验证任务图:让 agent 做一件多步骤的事(如「先建一个文件,再读它并生成摘要」),观察它是否先 `task_create` 出两个节点、给第二个带上 `depends_on`,并在第一个 `task_complete` 之前**认领不了**第二个(会返回「依赖未完成」)。产物在 `.task/tasks.json`,可以直接打开看依赖边。
 >
 > 想验证后台任务:让 agent 用 `is_background: true` 跑一条 `sleep 5 && echo done`——它应当立刻拿到 `bg_0001`、继续做别的事,几秒后终端里出现一条 `<task_notification>`(在下一轮的 history 里注入,`show_thinking=True` 时更容易看到)。
+>
+> 想验证 MCP:**在本目录下不用配任何东西**,发一句话让 agent 调 `demo__now`(比如「用 demo__now 看一下现在几点」)——它返回的是**服务器那个子进程**里的时间。先单独跑一遍 `python mcp.py`,能把「握手 → tools/list → 逐个调用 → 转成本项目工具格式」整条链路直接打在终端上,是这套东西最快的一次体检。(前提是本机有 `mcp_servers.json` 和它指向的 `mcp_demo_server.py` —— 后者**没有入库**,所以 clone 出来的仓库里这一条跑不通,那种情况下 MCP 工具数是 0,见 §10.2。)
+>
+> 想验证团队:说一句「开两个 agent,一个写一个审,让他们互相讨论后给我结论」。该看到的:`team_spawn` 返回带 ID 的成员(形如 `alice-7f3a`)、成员之间的消息以 `<team_message sender="...">` 出现在主 agent 的轮次里、`[bus] a → b: ...` 打在终端上。收尾说「让他们停下」,观察 `team_stop` → `exiting` → (成员确认)→ `offline` 这条链;**不要**在这一步只看 `team_stop` 的返回值就下结论——它的返回里明说了「不要据此宣布它已经退出了」。
+>
+> 想验证下线看门狗:改小 `claude.py` 顶部那两个常量(`OFFLINE_ACK_TIMEOUT_SECONDS` / `OFFLINE_MAX_ROUNDS`),再手动制造一个不回话的成员,就能在几十秒内看到「先重发一次 → 再判定失灵(dead)并通知主 agent」的完整过程。默认值下要等 4 分钟。
 
 ---
 
-## 10. 配置说明(`.env`)
+## 10. 配置说明
+
+三处配置,三个地方:环境变量(`.env`)、MCP 服务器清单(`mcp_servers.json`)、以及**根本不进配置、写死在源码里的模块常量**。
+
+### 10.1 环境变量(`.env`)
 
 | 键 | 默认值 | 说明 |
 |---|---|---|
@@ -763,6 +1111,44 @@ python main.py
 
 > 定时任务**没有 `.env` 配置项**:扫描间隔(`SCAN_INTERVAL_SECONDS=60`)、轮询间隔(`POLL_INTERVAL_SECONDS=5`)、唤醒冷却(`WAKE_COOLDOWN_SECONDS=60`)都是源码里的模块常量,改行为要改代码(见 §6.9)。
 
+> 团队**没有 `.env` 配置项**:下线握手超时(`OFFLINE_ACK_TIMEOUT_SECONDS=120`)与最大轮次(`OFFLINE_MAX_ROUNDS=2`)是 `claude.py` 顶部的模块常量。调小它们是在本地验证看门狗的最快办法(见 §9)。
+
+### 10.2 MCP 服务器配置(`mcp_servers.json`)
+
+MCP 的配置**不走 `.env`**,走一个独立的 JSON 文件 —— 因为它描述的是「一组子进程」,不是「一个值」:每个服务器要有自己的命令、参数、环境变量,JSON 天然装得下,`.env` 的 `KEY=VALUE` 装不下。
+
+`MCPManager(config_path=...)` 默认读工作目录下的 `mcp_servers.json`(常量 `DEFAULT_CONFIG_NAME`)。**文件不存在是最常见的正常状态**,静默降级为 0 个 MCP 工具(见 §6.13)。
+
+| 字段 | 默认值 | 说明 |
+|---|---|---|
+| `servers` | — | 服务器字典,键是**服务器名**(同时用作工具名前缀)。**`servers` 里每个键都会被当成一个服务器**:`_说明` 这类注释只能放在**顶层**,放进来程序会拿它去当服务器启动(仓库里那份配置的 `_说明` 就在顶层) |
+| `servers.<名>.command` | 当前解释器 | 可执行文件。不写就用跑 agent 的这个 Python —— 写死 `"python"` 可能撞上 PATH 里的另一个版本 |
+| `servers.<名>.args` | `[]` | 参数列表(通常就是那个服务器的 `.py` 路径) |
+| `servers.<名>.cwd` | 配置文件所在目录 | 工作目录。这样 `args` 里写相对路径就不用管 agent 是从哪个目录启动的 |
+| `servers.<名>.env` | `{}` | 追加到当前进程环境之上(**叠加,不是替换** —— 替换会把 `PATH` 抹掉,子进程连解释器都找不到) |
+| `servers.<名>.prefix` | 服务器名 + `__` | 工具名的前缀,**改成空串等于关掉防撞名保护**(见 §6.13) |
+| `servers.<名>.timeout` | `30`(`DEFAULT_TIMEOUT`) | 单次请求超时(秒) |
+| `servers.<名>.enabled` | `true` | 设 `false` 可临时关掉,连都不会去连 |
+
+> 仓库里那份 `mcp_servers.json` 指向 `mcp_demo_server.py`,而后者**是故意没有入库的本地测试服务器**(见 §2)。于是 clone 下来的仓库里,这份配置是**悬空**的:它会去启动一个不存在的文件,`load()` 捕获后打一行 stderr、继续跑,agent 照常起来、只是少 3 个工具。安全,但看着莫名其妙 —— 取舍见 §11。
+
+### 10.3 版本控制相关(`.gitignore` / `.gitattributes`)
+
+这一节回应 §8.3 的密钥那条。
+
+| 文件 | 作用 |
+|---|---|
+| `.env.example` | 入库的**脱敏模板**:字段名保留,密钥类字段(`KEY`/`TOKEN`/`SECRET`/`PASSWORD`)的值留空 |
+| `.gitignore` | `.env` / `.env.*`(放行 `.env.example`)、`tool_result/`、运行态目录(`.task/` `memory/` `transcript`)、`__pycache__/` |
+| `.gitattributes` | 只标注真正的二进制类型;并写明**本仓库不做行尾规范化** |
+
+两点值得单独说:
+
+- **`core.autocrlf` 必须保持 `false`**(仓库级本地配置)。项目里 20 个 `.py` 是 CRLF、LF 混着的(历史形成的现状),`autocrlf=true` 会在 `git add` 时转成 LF 存库、检出时又把**全部**文本文件改写成 CRLF —— 静默改写一半文件的工作区内容。这条配置**没有提交进库**,所以换台机器 clone 时要自己再设一次。
+- **运行态目录被排除在外**是有意的:`.task/`、`memory/` 是 agent 自己写的。排除它们,回退代码时就不会连带把记忆和任务库一起回退掉 —— 「代码回退」和「数据回退」是两件事。
+
+> 操作细节(日常三条命令、单文件/整次提交两种回退、怎么找被删的文件)在仓库根目录的 `版本控制.md` 里,不在本报告重复。
+
 ---
 
 ## 11. 后续建议(按优先级)
@@ -770,13 +1156,22 @@ python main.py
 1. **优化 L4 的替换策略**——L4 已打通,但目前是「整段替换为摘要」,建议改为「保留关键上下文 + 摘要」,降低摘要信息丢失的不可逆风险(见 §8.2);
 2. 统一命名拼写(`slient` / `compact_mannager`);
 3. 给 `calculator` 加白名单或换安全求值;给 bash 权限系统补充语义级规则;
-4. 把 `.env` 加进 `.gitignore`,初始化 git 做版本管理;
+4. ~~把 `.env` 加进 `.gitignore`,初始化 git 做版本管理~~ —— **已完成**(2026-09-18):仓库已 `git init`,仓库级 `core.autocrlf=false`,密钥与 `tool_result/` 已挡住,并写了 `版本控制.md`。遗留的是**密钥轮换**(§8.3,只有本人能做)和「`core.autocrlf` 这条保护只在本机生效」(§10.3);
 5. 增加最小可运行测试(至少覆盖压缩三层与 cron 解析/`compute_next_run` 的单测);
 6. 记忆:把 `recall_memory` 的检索路径与 `MEMORY_DIR` 对齐(去掉子 agent 硬编码相对路径),并决定 `search_by_tags` 的去留;
 7. 记忆:观察模型自主 `write_memory` 的实际触发率与质量,必要时在提示词加强「哪些值得记」的引导;`consolidate` 的 `max_body` / `max_tokens` 可按库规模调(文件多时注意 prompt 体积);
 8. 定时任务:给 `running` 加**超时回收**(超时置 `failed` 或退回 `pending`,并定一个重试上限),解决「agent 领走不汇报」的僵尸任务;把 `next_run` 展示进 `job_list`,让 agent 能回答「这个任务下次什么时候跑」;积压场景下可考虑给唤醒提示补一句「队列里还有 N 个」;
-9. 任务规划/后台任务:`TaskStore` 补锁(见 §8.3);把「后台任务失败」也显式告知模型(`<task_notification>` 目前只报「已完成」,成功失败要看输出);`BackgroundManager` 的 `bg_%04d` 计数不落盘,进程重启后会从头编号(同一会话内不会撞号,跨会话记录里可能重名)。
+9. 任务规划/后台任务:把「后台任务失败」也显式告知模型(`<task_notification>` 目前只报「已完成」,成功失败要看输出);`BackgroundManager` 的 `bg_%04d` 计数不落盘,进程重启后会从头编号(同一会话内不会撞号,跨会话记录里可能重名);`TaskStore` 那把锁见下一条;
+10. **团队:给 `TaskStore` 补锁,优先级已从「看着办」升到「该做了」**。上一版这条还挂在「将来」——那时写任务库的只有主线程。现在团队成员是**各自线程上的写者**,而且 5 个 `task_*` 工具对它们**默认开着**(`ROLE_MEMBER` 的禁用表里没有它们,`create_task_handlers` 是无条件注册的)。两种收口都行:加锁(治标但要动 `task.py`),或把 5 个 `task_*` 加进 `ROLE_MEMBER` 的禁用表(治本:并发面直接消失)。**推荐后者**,因为「成员该不该改主 agent 的任务计划」本身就是个待回答的设计问题,默认给的答案倾向于「不该」;
+11. **团队:把「成员失败」做得更可查**。现在只有两条线索:主 agent 轮次里的一条 `<team_notice>`(急件)、和 `team_list` 里的状态。成员线程是 `daemon=True`,内部异常若发生在 `_call_tool` 守卫覆盖不到的地方,只能靠 `status` 从 `alive` 变 `dead` 间接察觉。可考虑给成员加一个「最后一次异常」字段并在 `team_list` 里显示;
+12. **团队:规模与形态还没被真正压测过**。已实测的是 2~3 人的讨论型协作(能正确拉起、能互相通信、能按协议下线),但「同时拉起若干 agent 并行做各自的事、中间靠消息对齐」这种真正能体现团队价值的场景**还没逼出来**(§8.6)。想推进的话,下一步不是改代码,是设计一个**必须并行才有意义**的任务;
+13. **MCP:决定 `mcp_demo_server.py` 与 `mcp_servers.json` 的去留**。现状是「配置入库、被指向的服务器不入库」(`git ls-files` 里有 `mcp.py` 和 `mcp_servers.json`,`mcp_demo_server.py` 未跟踪),clone 下来的人会看到一份悬空配置(§10.2)。三条路:① 把 demo server 一起入库(最简单,但它只是个测试替身);② 把 `mcp_servers.json` 也加进 `.gitignore`,改成入库一份 `mcp_servers.example.json`(和 `.env` / `.env.example` 同一套做法,最一致);③ 什么都不动(安全但费解)。**推荐 ②** —— 它和这个项目已经确立的「配置模板入库、真配置不入库」惯例是同一条;
+14. **MCP:补一个「服务器掉线」的显式反馈**。目前子进程若中途死掉,表现是后续 `tools/call` 报错,而**模型看到的是一句工具错误**,它不一定能推断出「那个服务器整个没了」。可参考定时任务的 `next_run` 思路:在 `MCPManager` 里记下每个服务器的存活状态,并在工具错误信息里带上「服务器 X 已退出」。
 
 ---
 
 *报告初版基于 2026-08-26 状态;2026-09-06 补充记忆子系统(模型自主行为)与对应配置;2026-09-15 补充定时任务子系统(§6.9,含补跑机制与已知边界 §8.5)、任务规划(§6.10)与后台任务(§6.11),并**删除已废弃的 todo 机制描述**(旧 `TaskManager` / `task_write` / `<reminder>` 相关段落与死代码条目);同日将 `create_task_handlers` 工厂从 `TOOLS.py` 迁至 `task.py`(工厂跟着组件走,`TOOLS.py` 不再 import `task`),并把 `job_*` 等 handler 从 `__init__` 内的嵌套函数改为类方法(`__init__` 只装配与注册);`llm.py` / `memory.py` 改用 `load_dotenv(override=True)`(项目 `.env` 覆盖 shell 同名变量,防其他客户端的 `ANTHROPIC_*` 串扰端点,经交互式实测验证)。*
+
+*2026-09-18 补上两处此前完全缺失的子系统:**Agent 团队**(§6.12,`message.py` + `team.py`:三角色分工、三种总线读取方式、身份即 ID、控制面/数据面分离、下线握手与看门狗、以及两个只有跑起来才暴露的模型行为问题)与 **MCP 接入**(§6.13,`mcp.py`:stdio 握手、为什么必须有读线程、为什么请求要串行化、撞名即丢弃与前缀的安全含义、以及「连不上也必须能启动」这条边界);同时补上更早遗漏的 `write_file` 工具(§6.3),工具总数 19 → 25。随之更新:§1.1 能力清单(新增 9 / 10 两条)、§2 目录(新增 3 个源文件)、§3.1 架构图(成员线程挂上总线、MCP 子进程)、§4.1 主循环开场(团队消息成为第二条唤醒来源)、§7 设计亮点(新增第 14–19 条)、§8.3 与新增的 §8.6 / §8.7(已知边界)、§9 验证方法、§10.2 / §10.3(两个新的配置面)、§11(团队与 MCP 的后续项,并把已完成的「初始化 git」那条标记掉)。*
+
+*贯穿本轮新增内容的一条主线值得单独点出:**机制正确不等于行为正确**。团队这一版真正的坑不是握手协议写错了,而是成员之间会互相刷「喵~ 🐱」把轮次空转掉、以及成员会谎报「已完成」—— 这两个都修在了提示词层,因为代码层拦不住(见 §6.12、§7 第 19 条)。*
