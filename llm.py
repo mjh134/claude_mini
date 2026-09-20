@@ -3,7 +3,11 @@ from anthropic import (Anthropic, Timeout, APIConnectionError, APIStatusError,
                        PermissionDeniedError, RateLimitError)
 from dotenv import load_dotenv
 import os
+import re
 import json
+import time
+
+import ui
 
 #单次请求的等待上限。**这个值必须小**,因为 SDK 的默认值是 600 秒,而且它把超时
 #当可重试的错(APITimeoutError 是 APIConnectionError 的子类,实测 _should_retry 认它),
@@ -22,6 +26,84 @@ LLM_TIMEOUT_SECONDS = 120
 LLM_CONNECT_TIMEOUT_SECONDS = 10
 #SDK 层的重试次数。超时/连接失败/429/5xx 会重试,401/403/400 不会(一次就失败)
 LLM_MAX_RETRIES = 2
+
+
+#---------------------------------------------------------------------------
+#进模型之前的最后一道:终端控制字节(兜底 + 取证,**不是那个显示 bug 的修复**)
+#---------------------------------------------------------------------------
+#起因(2026-09-20):用户敲 `你好`,模型回了一句「…这个 ?[2;3m 是什么鬼」。
+#
+#★ 屏幕上那串 `?[2;3m` 的真因**已定案,在显示层,和模型无关**:patch_stdout() 默认
+#raw=False,走的是 prompt_toolkit 的 `output/vt100.py::Vt100_Output.write()`,那里面有
+#一句 `data.replace("\x1b", "?")` —— 每个 ESC 都被换成 `?`。修法是 `patch_stdout(raw=True)`,
+#已落在 ui.py。直接拿真库复现见 _a2_spike/probe_display.py。
+#
+#★ 我在这上面**把根因判反了两次**,都记在这儿免得后人重走:
+#  · 先认定"控制台不认 ANSI",去查 VT 位、Win32Output、ConEmuOutput、rich 的
+#    legacy_windows、color_system…… **全错**。用户真机报告(_a2_spike/diag_report.txt)
+#    写得清清楚楚:写字的是 Windows10_Output、VT 位本来就开着、环境**全是好的**。
+#    真相是 prompt_toolkit **故意**替换那串字节(免得别人的 print 弄花提示符)。
+#    教训:某字节在屏幕上变成**另一个字符**,先怀疑"有人替换了它",再怀疑"渲染器不认识它"。
+#  · 再认定"转义序列进了模型上下文",依据是"屏幕上打印出了 ?[2;3m" —— 那是**无效证据**:
+#    屏幕正是被怀疑的那一层画出来的。用户那句"这不就是显示问题嘛"是对的。
+#
+#★ 那么模型为什么会说那句话 —— **至今没有证据,我不编**。我改了搜法:被替换后的
+#`?[2;3m` 是**纯 ASCII,一个 ESC 都没有**,所以原来"904 个文件里 ESC 数为 0"那种搜法
+#**必然搜不到**它。改搜字面文本后,`tool_result/` 里 0 命中。那句引文没找到出处,
+#**别拿它当"上下文里进了脏字节"的证明**。
+#
+#那这段代码为什么还留着 —— 理由**不是**这次这个 bug,是个真实且常见的来源:
+#  1. 兜底。bash 工具跑 `ls --color=always`、带色的编译器、进度条,输出里就是实打实的
+#     ESC 字节,那会**真的进 history**,而且每一轮都在,永远不自己消失(compact 只是
+#     把它搬进摘要)。这个来源和显示层无关,值得在咽喉上过一遍。
+#  2. 取证。命中就报 —— 真有东西往上下文里灌,那一刻就知道,不用等模型说怪话。
+#     而这次**恰恰没有这个记录**,导致现象事后无法证伪,这比 bug 本身更该修。
+#换成可见占位而不是静默删:删了模型会以为输出缺了一段,看见 <ANSI> 反而能判断
+#"这里原本有颜色码"
+_OSC_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?")   #OSC(改标题栏那种)
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]")        #CSI(颜色、光标)
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")    #剩下的 C0 控制符(\n \r \t 留着)
+
+
+def _ctrl_mark(m):
+    ch = m.group()
+    return "<ESC>" if ch == "\x1b" else f"<0x{ord(ch):02x}>"
+
+
+def _scrub(text):
+    """把控制字节换成可见占位。返回 (新文本, 替换了几处)"""
+    n = 0
+    for rx in (_OSC_RE, _ANSI_RE):
+        text, k = rx.subn("<ANSI>", text)
+        n += k
+    text, k = _CTRL_RE.subn(_ctrl_mark, text)
+    return text, n + k
+
+
+def _scrub_obj(obj, where, hits):
+    if isinstance(obj, str):
+        new, n = _scrub(obj)
+        if n:
+            hits.append((where, n))
+        return new
+    if isinstance(obj, list):
+        return [_scrub_obj(x, where, hits) for x in obj]
+    if isinstance(obj, dict):
+        return {k: _scrub_obj(v, where, hits) for k, v in obj.items()}
+    return obj
+
+
+def _scrub_history(history):
+    """整个 history 过一遍。返回 (新的 history, [(位置, 处数)])。
+
+    **不做快速路径**:容器每一轮都重建,字符串只在真发现控制符时才换 ——
+    几百个小 dict 的重建相对一次网络请求可以忽略,而省掉它就要引入"有没有变"的
+    三态返回,那是拿可读性换一个量不出来的开销
+    """
+    hits = []
+    out = [_scrub_obj(m, f"#{i} {m.get('role', '?') if isinstance(m, dict) else '?'}", hits)
+           for i, m in enumerate(history)]
+    return out, hits
 
 
 #把 SDK 的异常翻成一句能读懂的话,给用户看的(所以是中文、说人话,不是堆栈)。
@@ -79,6 +161,17 @@ class LLM:
 
     def send(self, history):
 
+        #控制字节在**这一处**拦掉(理由见 _scrub_history 上面那段)。
+        #命中要报出来,而且要用 warn 不是 debug:它意味着有东西正往模型上下文里灌,
+        #这件事本身就是问题,不该只在 UI_VERBOSE 下才看得见
+        history, hits = _scrub_history(history)
+        if hits:
+            total = sum(n for _, n in hits)
+            detail = "、".join(f"{w}×{n}" for w, n in hits[:5])
+            ui.warn(f"上下文里有 {total} 处终端控制符,已转义成占位再发给模型({detail})")
+
+        self._dump_request(history, hits)
+
         return self.client.messages.create(
             model=self.model_id,
             max_tokens=8192,
@@ -87,6 +180,35 @@ class LLM:
             messages=history
         )
 
+    def _dump_request(self, history, hits):
+        """UI_VERBOSE=1 时把**这一请求原样**落盘,覆盖上一份。
+
+        为什么非有不可:模型说出"这个 ?[2;3m 是什么鬼"的时候,唯一能定案的证据是
+        "它到底收到了什么"。而这个项目**没留这个记录** —— history_backup.json 只在
+        压缩时写、transcript/ 是空的,于是一个已经确认存在的现象事后无法证伪
+        (2026-09-20 实测:904 个工具结果 + 全部源码扫下来 ESC 数为 0,查不下去)。
+
+        覆盖而不是追加:要看的就是**出错的那一次**,追加会把现场埋进几百份正常请求里
+        """
+        if not ui.UI_VERBOSE:
+            return
+        path = "llm_request.json"
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(
+                    {
+                        "when": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "model": self.model_id,
+                        "control_hits": hits,
+                        "messages": history,
+                    },
+                    f, ensure_ascii=False, default=str, indent=2
+                )
+            ui.debug(f"[llm] 本次请求已落盘:{path}")
+        except Exception as e:
+            #落盘失败不能影响这一轮对话 —— 它是取证工具,不是功能
+            ui.debug(f"[llm] 请求落盘失败:{e}")
+
     def summarize(self, history):
 
         conversation = json.dumps(
@@ -94,6 +216,11 @@ class LLM:
             ensure_ascii=False,
             default=str
         )
+        #压缩这条路也过一遍:它的产物(摘要)**会回到 history 里**,
+        #一个控制字节从这里漏进去,比从工具结果漏进去更难清 —— 它会藏在摘要正文中间
+        conversation, n = _scrub(conversation)
+        if n:
+            ui.warn(f"压缩输入里有 {n} 处终端控制符,已转义")
 
         prompt = f"""
             你是一个专业的上下文压缩助手，负责压缩一个 Coding Agent 的完整对话历史。

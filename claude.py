@@ -20,7 +20,9 @@ from mcp import MCPManager
 from team import (TeamRuntime, KIND_CHAT, KIND_OFFLINE_REQ, KIND_OFFLINE_AGREE,
                   KIND_OFFLINE_REFUSE, ALIVE, EXITING, OFFLINE, DEAD,
                   is_chat, is_control)
+import json
 import time
+import ui
 
 #下线握手的等待上限。设计.md 里的握手本来没有上限:成员不回话,主agent 就永远停在 exiting
 #(压测里成员线程崩掉后,主agent 就空等着,整整 13 分钟没人发现)。但"没回话"不等于"它死了",
@@ -97,7 +99,7 @@ class ClaudeMini():
         #只在主agent上对一次 —— 它是启动时唯一确定会被建出来的实例,没必要每个成员都刷一遍
         if role == ROLE_MAIN:
             for problem in check_roles(t["name"] for t in schemas):
-                print(f"[role] ⚠️ {problem}")
+                ui.warn(f"[role] {problem}")
 
         # 加载长期记忆并注入 system prompt
         session_memory = self.memory_manager.load_session_memory()
@@ -210,7 +212,7 @@ class ClaudeMini():
                                ("prompt_too_long", "prompt is too long", "too many tokens"))
                 if not too_long or reactive_retries >= 1:
                     raise
-                print("[reactive compact] prompt过长,压缩后重试")
+                ui.status("[reactive compact] prompt过长,压缩后重试")
                 history = self.compact_mannager.reactive_compact(history, self.llm)
                 reactive_retries += 1
                 continue
@@ -225,12 +227,15 @@ class ClaudeMini():
             for block in response.content:
                 if block.type == "thinking":
                     if self.show_thinking:
-                        print(f"\n🧠...\n{block.thinking}\n") #默认不展示思考过程
+                        #思考交给 ui 折叠:默认只出一行"思考 N 行",想看整段再开
+                        #UI_VERBOSE=1。以前是把整段 thinking 直接糊上来,
+                        #它经常比正文还长,一屏正文全被它顶出去了
+                        ui.thinking(block.thinking)
                     else:
                         continue
                 elif block.type == "text" :
                     if self.slient:
-                        print(f"\n🤖 Assistant: {block.text}\n")
+                        ui.assistant(block.text)
                     final_text += block.text
 
             if final_text:
@@ -307,7 +312,7 @@ class ClaudeMini():
             #数据面:普通消息包成 user 输入,交给既有的 run() 跑一整个工作期。
             # run() 返回(模型不再调工具)= 这条消息处理完了
             self.state = "work"
-            print(f"\n[{self.agent_id}] 收到来自 {msg.sender} 的消息")
+            ui.debug(f"\n[{self.agent_id}] 收到来自 {msg.sender} 的消息")
             team_history.append({
                 "role": "user",
                 "content": (
@@ -332,7 +337,7 @@ class ClaudeMini():
         self.state = "exit"
         left = self.message_bus.drain(self.agent_id)
         if left:
-            print(f"[{self.agent_id}] 下线,丢弃 {len(left)} 条来不及处理的消息")
+            ui.debug(f"[{self.agent_id}] 下线,丢弃 {len(left)} 条来不及处理的消息")
 
     def send_message(self, to: str, content: str) -> str:
         """团队协作:给另一个成员(或主agent)发消息。用 ID 寻址(名字只在唯一时可用)。
@@ -526,7 +531,7 @@ class ClaudeMini():
         elif msg.kind == KIND_OFFLINE_REFUSE:
             self._on_offline_reply(msg, agreed=False)
         else:
-            print(f"[{self.agent_id}] 收到未知控制消息 {msg.kind},忽略")
+            ui.debug(f"[{self.agent_id}] 收到未知控制消息 {msg.kind},忽略")
 
     #----- 成员侧:收到下线请求 → 最终确认 -----
 
@@ -537,15 +542,15 @@ class ClaudeMini():
         """
         runtime = self.team_runtime
         if runtime is not None and runtime.is_owner(self.agent_id):
-            print(f"[{self.agent_id}] 忽略发给主agent的下线请求")
+            ui.debug(f"[{self.agent_id}] 忽略发给主agent的下线请求")
             return
         #已经确认过下线、正在收尾(self.running 由 _reply_offline 置 False):
         #不要把第二份请求(主agent的重发)当成新活再干一轮
         if not self.running:
-            print(f"[{self.agent_id}] 已在退出流程中,忽略重复的下线请求")
+            ui.debug(f"[{self.agent_id}] 已在退出流程中,忽略重复的下线请求")
             return
 
-        print(f"\n[{self.agent_id}] 主agent请求下线,做最终确认")
+        ui.status(f"\n[{self.agent_id}] 主agent请求下线,做最终确认")
         #一拿到请求就报 work:看门狗只在成员"空闲却没回应"时才重发,
         #"有请求在手 = work"这条不变量是它的安全依据,所以要在任何判断之前就置上
         self.state = "work"
@@ -592,10 +597,10 @@ class ClaudeMini():
         if agree:
             self.running = False        # ← 真正停线程的是这里;主agent只改逻辑状态
             self.state = "exit"
-            print(f"[{self.agent_id}] 已确认下线,线程退出")
+            ui.status(f"[{self.agent_id}] 已确认下线,线程退出")
         else:
             self.state = "idle"
-            print(f"[{self.agent_id}] 拒绝下线:{reason}")
+            ui.status(f"[{self.agent_id}] 拒绝下线:{reason}")
 
     #----- 主agent侧:收到成员的最终确认 -----
 
@@ -603,11 +608,11 @@ class ClaudeMini():
         """成员的最终确认。逻辑状态要等它真的停下来才置为 offline(设计.md 三/四)"""
         runtime = self.team_runtime
         if runtime is None or not runtime.is_owner(self.agent_id):
-            print(f"[{self.agent_id}] 忽略不属于自己团队的下线确认")
+            ui.debug(f"[{self.agent_id}] 忽略不属于自己团队的下线确认")
             return
         member = runtime.get(msg.sender)
         if member is None:
-            print(f"[{self.agent_id}] 下线确认来自未知成员 {msg.sender},忽略")
+            ui.debug(f"[{self.agent_id}] 下线确认来自未知成员 {msg.sender},忽略")
             return
         #回信到了,握手就结束了 —— 不管它同意还是拒绝,都撤掉看门狗
         #(这条是"拒绝下线的成员不会被超时判死"的保证)
@@ -639,7 +644,7 @@ class ClaudeMini():
         紧急与否记在通知自己身上,不在别处另存一个标志位:两者就不可能跑到不同步
         (一旦错开,主循环会每秒都以为有事、每秒叫一次模型)
         """
-        print(f"[team] {text}")
+        ui.status(f"[team] {text}")
         self._notices.append((text, wake))
 
     #----- 下线握手看门狗:等待必须有上限(设计.md 九的握手补一条兜底)-----
@@ -702,11 +707,11 @@ class ClaudeMini():
                 #空闲却没回应:它手上没活,消息大概率没被处理 → 重发
                 #(只有第一轮会走到这里,所以重发最多一次)
                 self._send_offline_request(member)
-                print(f"[timeout] {member.id} 等满 {OFFLINE_ACK_TIMEOUT_SECONDS} 秒没回应下线请求,"
+                ui.warn(f"[timeout] {member.id} 等满 {OFFLINE_ACK_TIMEOUT_SECONDS} 秒没回应下线请求,"
                       f"而它是空闲的,已重发一次")
             else:
                 #它在干活(很可能正是在做下线确认):重发会让它重复干活,只续期
-                print(f"[timeout] {member.id} 等满 {OFFLINE_ACK_TIMEOUT_SECONDS} 秒没回应下线请求,"
+                ui.warn(f"[timeout] {member.id} 等满 {OFFLINE_ACK_TIMEOUT_SECONDS} 秒没回应下线请求,"
                       f"但它正在 {member.self_state},不重发(免得重复干活),再等一轮")
 
     def _give_up_on_member(self, member):
@@ -763,7 +768,7 @@ class ClaudeMini():
             #已经决定停了就不要再处理:确认期间新到的下线请求(比如主agent的重发)
             #会把成员重新叫起来干一整轮 —— 已经签过字的人不该被再拉起来上班
             if not self.running:
-                print(f"[{self.agent_id}] 已在退出流程中,丢弃 {len(deferred)} 条推迟的控制消息")
+                ui.debug(f"[{self.agent_id}] 已在退出流程中,丢弃 {len(deferred)} 条推迟的控制消息")
                 return
             self._handle_control(msg)
 
@@ -930,9 +935,72 @@ class ClaudeMini():
         return self.run_subagent(subagent_prompt)
 
     def excute_tool(self, block):
+        """工具调用的唯一入口,顺带负责让它在屏幕上**看得见**。
+
+        以前工具跑起来是全黑的:下面那句工具输出的 print 是注释掉的,模型调了什么、
+        跑到第几个、回来了没有,屏幕上一点动静都没有,只能干等。
+
+        包成一层外壳,而不是在下面每个 return 前各插一句:这里面有六个出口
+        (角色不允许 / 被 hook 拦 / 后台 / 未知工具 / 参数错 / 正常返回),
+        漏掉任何一个,那个出口在屏幕上就永远只有半句话 —— 报"开始调"却永远等不到"回来"
+        是最难受的状态,因为它看起来像卡住了
+        """
         if block.type != "tool_use":
             raise ValueError(f"Invalid block type: {block.type}. Expected 'tool_use'.")
 
+        who = self._who()
+        #brief 只给屏幕看(一个代表参数,content 还截到 40 字);full 是完整 input,
+        #登记进折叠处供 /展开 调出来 —— 这两件事要的东西不一样,所以分开传
+        ui.tool_call(block.name, self._args_brief(block), who=who,
+                     full=json.dumps(block.input, ensure_ascii=False, indent=2)
+                     if isinstance(block.input, dict) else block.input)
+
+        t0 = time.perf_counter()
+        output = self._excute_tool(block)
+        ui.tool_result(output, ms=int((time.perf_counter() - t0) * 1000), who=who)
+        return output
+
+    def _who(self):
+        """工具行前面那个身份标签。主agent不标 —— 它就是默认那个。
+
+        **不能直接拿 agent_id 当标签**:前台子agent 的 agent_name 是默认的 "main"
+        (见 _build_subagent),那是**原有约定**,不是能给外人看的名字。直接用它,
+        一个子agent就会顶着自己主agent的名字干活 —— 标错人比不标更糟,
+        等于把"这行是谁打的"这个唯一目的搞反了。
+
+        所以分三种:
+            主agent          None      —— 不需要
+            子agent          "子"      —— 它的任务在"🤖 子agent 开始"那行里,不在这重复
+            团队成员/后台任务  自己的 id  —— 这些**真的**能区分,不标就分不清
+
+        后台子agent(_build_subagent(agent_name=task_id))id 是有意义的,bg_0002 这种,
+        所以下面认的是"名字还是不是那个默认哨兵",不是"是不是子agent"
+        """
+        if self.role == ROLE_MAIN:
+            return None
+        if self.role == ROLE_SUBAGENT and self.agent_name == "main":
+            return "子"
+        return self.agent_id
+
+    def _args_brief(self, block):
+        """把工具参数压成给屏幕看的那一行。
+
+        取一个**代表性的参数**,而不是把整个 input 打出来:bash 要看的是 command、
+        write_file 是 path;整字典打出来会带上 is_background 这类噪音,把真正的参数挤没
+        """
+        data = block.input
+        if not isinstance(data, dict):
+            return ui.one_line(data)
+        for key in ("command", "path", "prompt", "query", "pattern", "content"):
+            if key in data:
+                #content 通常是整段文件正文,不截断会把这一行撑爆
+                return ui.one_line(data[key], 40 if key == "content" else None)
+        if not data:
+            return ""
+        key = next(iter(data))      #都不匹配:报第一个,总比不报强
+        return ui.one_line(f"{key}={data[key]}")
+
+    def _excute_tool(self, block):
         #运行时那道保险:看不见的工具模型不会去调,所以正常路径下不会命中。
         #但幻觉出来的名字、压缩后重放的历史、以后新增的调用路径都可能绕过来,调之前再对一次。
         if block.name not in self.allowed_tools:
@@ -948,7 +1016,7 @@ class ClaudeMini():
         #结论:权限判定属于**发起调用的线程**,所以必须在这里做。
         hook_result = HOOKS.trigger_hooks("PreToolUse", block)
         if hook_result is not None:
-            print(f"Hook result: {hook_result}")
+            ui.debug(f"Hook result: {hook_result}")
             return hook_result
 
         #后台执行:同一个"后台"策略,按工具选执行体。
@@ -966,9 +1034,7 @@ class ClaudeMini():
         if handler is None:
             return f"❌ Unknown tool: {block.name}"
 
-        output = self._call_tool(handler, block)
-        #print(f"Tool {block.name} executed with output: {output}")
-        return output
+        return self._call_tool(handler, block)
 
     def _call_tool(self, handler, block):
         """调用工具 handler:把"调用姿势不对"退化成一条工具错误,绝不让异常穿出去。

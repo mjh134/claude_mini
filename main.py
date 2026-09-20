@@ -1,7 +1,7 @@
-import sys
 import queue
 import threading
 import HOOKS
+import ui
 from claude import ClaudeMini
 from dispatcher import JobDispatcher
 from llm import explain_error
@@ -31,8 +31,8 @@ def run_turn(claude_mini, history):
         #失败时 history 的末尾必然是**一条 user 消息**:assistant 那段是在 llm.send()
         #**返回之后**才 append 的(claude.py),所以不会留下没有 tool_result 的 tool_use ——
         #下一次请求的历史是自洽的,直接重说一次就行,不需要修补历史
-        print(f"\n⚠️ 这一轮失败了,已经中断:{explain_error(e)}")
-        print("   会话还在,可以直接重说一次。")
+        ui.error(f"这一轮失败了,已经中断:{explain_error(e)}")
+        ui.status("会话还在,可以直接重说一次。")
 
 
 
@@ -52,16 +52,15 @@ def user_loop(history,claude_mini:ClaudeMini):
 
     inbox = queue.Queue()
 
-    #读线程:专职阻塞在 input() 上(它阻塞没关系,主循环不等它),把读到的行塞进队列
-    def read_input():
-        while True:
-            try:
-                inbox.put(input("User: "))
-            except (EOFError, KeyboardInterrupt):
-                inbox.put(None)     #None 当作退出信号
-                return
-
-    threading.Thread(target=read_input, daemon=True).start()
+    #读线程:专职读输入(它阻塞没关系,主循环不等它),把读到的行塞进队列
+    #
+    #主体在 ui.read_input —— 它和 ui.ask_sync 是一对(一个拿走终端、一个借回来,
+    #共用 PT_ACTIVE),必须放在一起改。这里只负责起线程。
+    #
+    #效果:主循环这条线程打东西时,patch_stdout 会先把提示符擦掉、打完再画回来,
+    #不再是"输出从提示符身上碾过去"。代价是**终端的所有权归读线程** ——
+    #主线程要反过来问用户(权限询问)就得走 ui.ask_sync 借,坑见那边的注释。
+    threading.Thread(target=ui.read_input, args=(inbox,), daemon=True).start()
 
     while True:
         try:
@@ -83,12 +82,19 @@ def user_loop(history,claude_mini:ClaudeMini):
                 run_turn(claude_mini, history)    #run_turn 里会把 <team_message> 和 <task_notification> 收进 history
             continue
         except KeyboardInterrupt:           #Ctrl+C 落在主线程
-            print("\nExiting the assistant. Goodbye!")
+            ui.status("退出。")
             break
 
         if message is None or message.lower() in ["q"]:
-            print("Exiting the assistant. Goodbye!")
+            ui.status("退出。")
             break
+        #斜杠命令(目前只有 /展开、/折叠列表、/折叠、/帮助)。
+        #★ **只拦 ui 认领的那几条**,认不出就往下走、原样发给模型 ——
+        #这个项目里 /ask 这类本来就是普通文本,不能因为加了个命令层就把它吞掉。
+        #命令不进 history:它是"看"的动作,不是对模型说的话,
+        #进历史只会让模型下一轮莫名其妙地收到一句 /展开
+        if ui.run_command(message):
+            continue
         history.append({"role": "user", "content": message})
         #agent循环
         run_turn(claude_mini, history)
@@ -111,7 +117,7 @@ if __name__ == "__main__":
     dispatcher = JobDispatcher(claude_mini, claude_mini.scheduler)
     dispatcher.start()
 
-    print("Welcome to the Claude Mini Assistant!")
+    ui.banner([("Claude Mini", "bold"), ("   输入 q 退出", "dim")])
 
     history = []
     user_loop(history,claude_mini)
@@ -124,16 +130,16 @@ if __name__ == "__main__":
     pending_main = claude_mini.task_runner.running()
     pending_jobs = dispatcher.runner.running()
     if pending_main or pending_jobs:
-        print("⏳ 还有后台任务在跑,等它们收尾(每条通道最多 10 秒)…")
+        ui.status("还有后台任务在跑,等它们收尾(每条通道最多 10 秒)…")
         left_main = claude_mini.task_runner.wait_running(timeout=10)
         left_jobs = dispatcher.runner.wait_running(timeout=10)
         left = left_main + left_jobs
         if left:
-            print(f"⚠️ 还有 {len(left)} 个后台任务没跑完({'、'.join(left)}),退出会中断它们")
+            ui.warn(f"还有 {len(left)} 个后台任务没跑完({'、'.join(left)}),退出会中断它们")
         #被打断的定时任务要留个交代:盘上会停在 running,下次启动时 _load 的僵尸回收
         #把它放回待执行(崩掉的这一次不补跑)。说一声,免得用户以为任务就此丢了
         if left_jobs:
-            print(f"ℹ️ 其中 {len(left_jobs)} 个是定时任务,会在下次启动时放回待执行")
+            ui.status(f"其中 {len(left_jobs)} 个是定时任务,会在下次启动时放回待执行")
 
     # 整个会话结束:经验记忆达到阈值时,交给模型做一次去重整理(LLM 驱动;失败不阻断退出)
     claude_mini.memory_manager.consolidate_if_due(claude_mini.llm)

@@ -26,6 +26,12 @@ transcript
 *.log
 run_log.txt
 stress_log.txt
+# llm.py 每次请求覆盖重写的调试 dump。**没有密钥**(只有 when/model/messages),
+# 但里面有完整的思考文本、工具调用参数和模型回复原文 —— 和 tool_result/ 同一类:
+# 运行态产物,不是源码。而且每请求一次就变一次,提交进去只会变成持续噪音
+llm_request.json
+# 工具跑出来的产物(比如 py_line_count.md),同理不入库
+out/
 
 # ============================================================
 # 本机个人配置 / 编辑器
