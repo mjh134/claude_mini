@@ -4,6 +4,7 @@ import os
 import json
 import re
 from datetime import datetime
+import ui
 
 
 # 记忆整理(consolidate)配置
@@ -56,7 +57,7 @@ class MemoryManager:
         filepath.write_text(frontmatter + memory, encoding="utf-8")
         self._add_to_index(memory_id, filename, title, tags, created)
 
-        print("记忆已保存至：" + str(filepath))
+        ui.status("记忆已保存至：" + str(filepath))
         return str(filepath)
 
     def _extract_tags_from_content(self, content: str) -> list:
@@ -164,7 +165,7 @@ class MemoryManager:
         try:
             data = json.loads(cand)
         except Exception as e:
-            print(f"consolidate JSON 解析失败:{e}")
+            ui.debug(f"consolidate JSON 解析失败:{e}")
             return []
         if isinstance(data, list):
             return data
@@ -199,7 +200,7 @@ class MemoryManager:
                     index["tags"].setdefault(tag, []).append(memory_id)
 
             except Exception as e:
-                print(f"索引重建时跳过 {filepath.name}: {e}")
+                ui.debug(f"索引重建时跳过 {filepath.name}: {e}")
 
         self.index_file.write_text(
             json.dumps(index, ensure_ascii=False, indent=2),
@@ -421,13 +422,13 @@ class MemoryManager:
             rep = self.consolidate(llm)
             rep["triggered"] = True
             if rep.get("deleted_files"):
-                print(f"[consolidate] 会话结束整理:删除 {len(rep['deleted_files'])} 份 -> "
+                ui.debug(f"[consolidate] 会话结束整理:删除 {len(rep['deleted_files'])} 份 -> "
                       f"{rep['after']} 份;快照={rep['snapshot']}")
             else:
-                print(f"[consolidate] 会话结束整理:无需删除({rep.get('note') or '无动作'})")
+                ui.debug(f"[consolidate] 会话结束整理:无需删除({rep.get('note') or '无动作'})")
             return rep
         except Exception as e:
-            print(f"[consolidate] 会话结束整理失败(不阻断退出): {e}")
+            ui.warn(f"[consolidate] 会话结束整理失败(不阻断退出): {e}")
             empty["note"] = f"整理失败: {e}"
             return empty
 

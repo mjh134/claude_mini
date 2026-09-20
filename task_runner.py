@@ -1,6 +1,7 @@
 import threading
 import time
 from bash_exec import execute_bash
+import ui
 
 #后台 agent 的并发上限。
 #bash 任务便宜(一条子进程),agent 任务**烧 token** —— 每个后台子agent 都是一整个 LLM 循环。
@@ -170,7 +171,7 @@ class TaskRunner:
             try:
                 on_done(status == "completed", output)
             except Exception as e:
-                print(f"[task_runner] {task_id} 的完成回调出错:{type(e).__name__}: {e}")
+                ui.warn(f"[task_runner] {task_id} 的完成回调出错:{type(e).__name__}: {e}")
         return True
 
     #看门狗:把"线程已经没了、结果却没留下"的任务补成一条**失败结果**塞进邮箱。
@@ -196,7 +197,7 @@ class TaskRunner:
         for task_id in dead:
             #_finalize 是幂等的,谁先收到尾谁负责喊这一声
             if self._finalize(task_id, "failed", _THREAD_DIED_OUTPUT):
-                print(f"[task_runner] {task_id} 的后台线程在写出结果之前就终止了,"
+                ui.warn(f"[task_runner] {task_id} 的后台线程在写出结果之前就终止了,"
                       f"已按失败补一条通知")
         return dead
 

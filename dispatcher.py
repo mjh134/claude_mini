@@ -4,6 +4,7 @@ import time
 from claude import ClaudeMini
 from task_runner import TaskRunner
 from TOOLS import ROLE_MAIN, TEAM_TOOLS
+import ui
 
 #轮询间隔(秒):多久看一眼 scheduler 队列里有没有到点的任务
 POLL_INTERVAL_SECONDS = 5
@@ -67,7 +68,7 @@ class JobDispatcher:
             except Exception as e:
                 #轮询线程不能死:它是定时任务唯一的执行通道,死了就再没人跑任务,
                 #而且不会有任何提示 —— 表现是"任务创建了却永远不执行",最难查的那种
-                print(f"[dispatcher] 本轮派发出错: {type(e).__name__}: {e}")
+                ui.warn(f"[dispatcher] 本轮派发出错: {type(e).__name__}: {e}")
             time.sleep(self.poll_interval)
 
     #把队列里到点的任务尽可能多地派出去,直到没名额或队列空
@@ -86,7 +87,7 @@ class JobDispatcher:
             job = self.scheduler.take_job()     #出队、置 running、推进 next_run
             if job is None:
                 return      #has_pending 与实际取之间队列空了(还有别的消费者时)
-            print(f"[dispatcher] 派发任务 {job.id}:{job.content[:120]}")
+            ui.status(f"[dispatcher] 派发任务 {job.id}:{job.content[:120]}")
             task_id = self.runner.submit_agent(
                 lambda tid, j=job: self._run_job(tid, j),
                 on_done=lambda ok, out, jid=job.id: self._report(jid, ok, out))
@@ -94,7 +95,7 @@ class JobDispatcher:
                 #问了名额、到提交之间被抢走了(同一 runner 上别的派发也在抢名额)。
                 #任务必须原样放回:take_job 已经推进过 next_run,不放回这次派发就白丢,
                 #一次性任务(once_at)更会因此永远不再触发
-                print(f"[dispatcher] 名额被抢,任务 {job.id} 放回待执行")
+                ui.debug(f"[dispatcher] 名额被抢,任务 {job.id} 放回待执行")
                 self.scheduler.requeue_job(job.id)
                 return      #名额已满,本轮到此为止
 

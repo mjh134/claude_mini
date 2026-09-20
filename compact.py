@@ -2,6 +2,7 @@ from dotenv import load_dotenv
 import os
 from pathlib import Path
 import json
+import ui
 
 class CompactManager():
     BASE_DIR = Path(__file__).resolve().parent
@@ -23,10 +24,10 @@ class CompactManager():
                 content = json.dumps(content, ensure_ascii=False, default=str)
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(content)
-            print(f"完整结果已保存至：{filepath}")
+            ui.debug(f"完整结果已保存至：{filepath}")
             return str(filepath)
         except Exception as e:
-            print(f"工具结果保存失败：{e}")
+            ui.warn(f"工具结果保存失败：{e}")
             return None
         
     #单次工具调用结果过长
@@ -79,7 +80,7 @@ class CompactManager():
                 with open(path, 'w', encoding='utf-8') as f:
                     f.write(payload)
             except Exception as e:
-                print(f"压缩消息保存失败:{e}")
+                ui.warn(f"压缩消息保存失败:{e}")
 
             #不新增一条消息，将断点信息加到首部最后一条消息中
             note = f"[{tail_start - head_end} messages archived at {self.transcript}]"
@@ -146,10 +147,10 @@ class CompactManager():
                         indent=2
                     )
                 )
-            print(f"完整历史已保存至：{path}")
+            ui.debug(f"完整历史已保存至：{path}")
             return str(path)
         except Exception as e:
-            print(f"历史保存失败：{e}")
+            ui.warn(f"历史保存失败：{e}")
             return None
 
     #调用大模型总结上下文
@@ -159,10 +160,10 @@ class CompactManager():
             try:
                 summary = llm.summarize_history(history)
             except Exception as e:
-                print(f"总结失败:{e},本次跳过压缩")
+                ui.status(f"总结失败:{e},本次跳过压缩")
                 return history
             if not summary:
-                print("总结为空,本次跳过压缩")
+                ui.status("总结为空,本次跳过压缩")
                 return history
             new_history = [
                 {
@@ -194,10 +195,10 @@ class CompactManager():
         try:
             summary = llm.summarize_history(old)
         except Exception as e:
-            print(f"兜底总结失败:{e},放弃重试")
+            ui.status(f"兜底总结失败:{e},放弃重试")
             return history
         if not summary:
-            print("兜底总结为空,放弃重试")
+            ui.status("兜底总结为空,放弃重试")
             return history
         new_history = [{
             "role": "user",

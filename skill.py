@@ -1,6 +1,7 @@
 from dotenv import load_dotenv
 import os
 from pathlib import Path
+import ui
 
 class SkillLoader:
     BASE_DIR = Path(__file__).resolve().parent
@@ -15,7 +16,7 @@ class SkillLoader:
     #扫描skill
     def scan(self):
         if not self.dir.exists():
-            print("路径错误")
+            ui.warn("路径错误")
             return
 
         for sub_dir in self.dir.iterdir():
@@ -55,7 +56,7 @@ class SkillLoader:
             }
 
         for name in self.registry:
-            print(f"加载skill:{name}")
+            ui.debug(f"加载skill:{name}")
 
     #返回skill元数据
     def catalog(self):

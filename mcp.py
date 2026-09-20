@@ -71,6 +71,7 @@ import subprocess
 import sys
 import threading
 from pathlib import Path
+import ui
 
 #客户端声明的协议版本(按日期命名)。这只是"我支持这个";
 #服务器在 initialize 的回应里给出它实际要用的版本,以它为准 —— 老服务器回旧版本是正常的。
@@ -338,7 +339,7 @@ class MCPClient:
             try:
                 self._inbox.put(json.loads(line))
             except json.JSONDecodeError:
-                print(f"[mcp] 服务器往 stdout 打了非协议内容,已忽略:{line[:120]}")
+                ui.warn(f"[mcp] 服务器往 stdout 打了非协议内容,已忽略:{line[:120]}")
         self._inbox.put(None)
 
     def _answer_server(self, msg):
@@ -406,7 +407,7 @@ class MCPManager:
                 raise ValueError("servers 得是一个对象:{服务器名: 配置}")
         except (OSError, ValueError, json.JSONDecodeError) as e:
             self.failed.append((self.config_path.name, f"配置读不出来:{e}"))
-            print(f"[mcp] {self.config_path.name} 解析失败,本次不加载 MCP:{e}")
+            ui.warn(f"[mcp] {self.config_path.name} 解析失败,本次不加载 MCP:{e}")
             return
 
         for name, cfg in servers.items():
@@ -430,11 +431,11 @@ class MCPManager:
                 #服务器名字把整个程序拦在启动阶段(这正是实测踩到的)
                 client.close()
                 self.failed.append((name, f"{type(e).__name__}: {e}"))
-                print(f"[mcp] 服务器 {name} 连接失败,已跳过:{type(e).__name__}: {e}")
+                ui.warn(f"[mcp] 服务器 {name} 连接失败,已跳过:{type(e).__name__}: {e}")
                 continue
 
             self.servers.append({"name": name, "prefix": prefix, "client": client})
-            print(f"[mcp] 已连接 {name}:{len(client.tools)} 个工具"
+            ui.debug(f"[mcp] 已连接 {name}:{len(client.tools)} 个工具"
                   f"({', '.join(t['name'] for t in client.tools) or '无'})")
 
     def _server_arg(self, cfg):
@@ -472,7 +473,7 @@ class MCPManager:
             for schema in client.as_tools(prefix=prefix):
                 name = schema["name"]
                 if name in taken:
-                    print(f"[mcp] 工具名 {name} 已被占用,跳过它(来自服务器 {s['name']})")
+                    ui.warn(f"[mcp] 工具名 {name} 已被占用,跳过它(来自服务器 {s['name']})")
                     continue
                 taken.add(name)
                 schemas.append(schema)

@@ -5,6 +5,7 @@ import uuid
 from dataclasses import dataclass, asdict
 from datetime import datetime, timedelta
 from pathlib import Path
+import ui
 
 # 调度器扫描间隔(秒):每分钟扫一次,与 cron 的最小粒度一致
 SCAN_INTERVAL_SECONDS = 60
@@ -181,7 +182,7 @@ class Scheduler:
                 job = Job(**data)
             except (TypeError, ValueError) as e:
                 #单条任务损坏(如手改坏了 schedule)只跳过它,不该拖垮整个调度器
-                print(f"[scheduler] 跳过无法加载的任务 {job_id}: {e}")
+                ui.debug(f"[scheduler] 跳过无法加载的任务 {job_id}: {e}")
                 continue
             #僵尸回收:盘上还写着 running,说明上次进程是在这个任务执行到一半时没的
             #(跑完了就会被报成 completed/failed)。不回收的话 tick 永远跳过它 —— 任务从此哑掉。
@@ -189,7 +190,7 @@ class Scheduler:
             #(发消息、改文件),宁可漏一次也不能重放。next_run 在 take_job 里已经推进过了,
             #所以这里只改状态,tick 不会再把它当成"欠一次"立刻重跑
             if job.status == JOB_RUNNING:
-                print(f"[scheduler] 任务 {job_id} 上次执行没有收尾(进程中断),放回待执行")
+                ui.status(f"[scheduler] 任务 {job_id} 上次执行没有收尾(进程中断),放回待执行")
                 self._transition(job, JOB_PENDING)
             #旧版任务库没有 next_run 字段,从上次实际派发的时刻往后补算
             #(没派发过就从当前时刻算,同样只补一次 —— compute_next_run 只给一个点,
@@ -200,7 +201,7 @@ class Scheduler:
             #None)却在执行中被打断。崩掉的那次不补跑,所以它到此为止 —— 说清楚,
             #而不是留一条永远 pending 的任务让人猜。要再跑只能重新创建
             if job.status == JOB_PENDING and job.next_run is None and job.once_at:
-                print(f"[scheduler] 任务 {job_id} 是一次性任务且时刻已过({job.once_at}),"
+                ui.status(f"[scheduler] 任务 {job_id} 是一次性任务且时刻已过({job.once_at}),"
                       f"不会再触发;要再执行请重新创建")
             self.jobs[job_id] = job
 
@@ -251,7 +252,7 @@ class Scheduler:
                 if any(j.id == job.id for j in self.queue):   #还在队列里没被取走,不再入队
                     continue
                 if job.next_run < now_bucket:   #原定时刻已过去 → 这次是补跑,只提示不阻断
-                    print(f"[scheduler] 补跑任务 {job.id}(原定 {job.next_run},"
+                    ui.debug(f"[scheduler] 补跑任务 {job.id}(原定 {job.next_run},"
                           f"现在 {now_bucket}):{job.content}")
                 self._transition(job, JOB_PENDING)  #周期任务开启新一轮(completed/failed → pending)
                 self.queue.append(job)
@@ -298,7 +299,7 @@ class Scheduler:
             if job is None:
                 #任务在跑的时候被删了(job_delete 允许删任何状态)。结果无处可写,
                 #但这不算错误:只是白跑了一轮,打一行日志留痕
-                print(f"[scheduler] 任务 {job_id} 已不存在(执行期间被删除),本轮结果丢弃")
+                ui.debug(f"[scheduler] 任务 {job_id} 已不存在(执行期间被删除),本轮结果丢弃")
                 return
             self._transition(job, status)
             self._save()
@@ -308,10 +309,15 @@ class Scheduler:
         #只报"完成"而丢掉产出,用户没法知道它干了什么。
         #压成一行:这段是打在用户的终端上的,多行输出会插进用户的输入提示符中间;
         #要格式化的产出应该由任务自己写进文件(content 里就该这么要求)
-        mark = "完成" if ok else "失败"
         flat = " ".join((output or "").split())
         tail = f":{flat[:300]}" if flat else ""
-        print(f"[scheduler] 任务 {job_id} 执行{mark}{tail}")
+        text = f"[scheduler] 任务 {job_id} 执行{'完成' if ok else '失败'}{tail}"
+        #失败走 warn(黄),成功走 status(dim):定时任务多数时候是成功的,
+        #全用同一种颜色的话,真失败的那次会淹在一堆"完成"里看不见
+        if ok:
+            ui.status(text)
+        else:
+            ui.warn(text)
 
     #把任务原样放回待执行:派发器拿到名额之前被别处抢走了,这次派发没成
     #next_run 要**还原成当初那个到点时刻**(从 inflight 里取),否则这次就白丢了 ——
@@ -322,7 +328,7 @@ class Scheduler:
             due = self.inflight.pop(job_id, None)
             job = self.jobs.get(job_id)
             if job is None:     #和 report_done 一样容忍"任务没了":被删掉就没什么可放回的
-                print(f"[scheduler] 任务 {job_id} 已不存在(派发期间被删除),无需放回")
+                ui.debug(f"[scheduler] 任务 {job_id} 已不存在(派发期间被删除),无需放回")
                 return
             self._transition(job, JOB_PENDING)
             if due is not None:

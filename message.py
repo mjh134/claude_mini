@@ -3,6 +3,7 @@
 
 import threading
 from dataclasses import dataclass
+import ui
 
 
 @dataclass
@@ -26,7 +27,7 @@ class MessageBus:
             self.messages.append(message)
             self._cond.notify_all()     # 唤醒所有agent检查消息
         #消息流向可见(交互测试用;嫌吵可以删掉这行)
-        print(f"[bus] {message.sender} → {message.receiver}: {message.content[:60]}")
+        ui.debug(f"[bus] {message.sender} → {message.receiver}: {message.content[:60]}")
         return True
 
     #领取消息
