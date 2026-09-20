@@ -448,9 +448,18 @@ len(messages) > MAX_MESSAGES 时:
 - **建连必须单独给值**。`timeout=120` 会把 `connect` 也一起变成 120(默认才 5 秒),于是「`base_url` 写错」「DNS 挂了」这种本来 5 秒就报的错要拖两分钟——那是**净退步**。用 `anthropic.Timeout(120, connect=10)` 的分量写法避开;
 - **没做成 `.env` 键**。最接近的同类(`claude.py` 的两个握手常量)也不是 env 驱动的,值本身是策略不是机器配置;而且 `llm.py` 的 `load_dotenv` 在 `__init__` 里,**模块级 `os.getenv` 会跑在它前面静默退化成默认值**(`PERMISSIONS.py:51-60` 有一段专门讲这个坑),不引入 env 就完全绕开它。
 
-**代价要说清楚**:模型偶尔真要生成超过 120 秒时会被误杀(非流式请求,8192 tokens)。真遇到了就调大这一个数,别的都不用动。另外超时和重试都挂在 **client** 上,所以 `send()` 和 `summarize()` 一起被覆盖——`memory.py` 那边有一处绕过 `send` 直接调 `client.messages.create` 的,也照样管得住。
+**代价要说清楚**:模型偶尔真要生成超过 120 秒时会被误杀(8192 tokens)。真遇到了就调大这一个数,别的都不用动。另外超时和重试都挂在 **client** 上,所以 `send()` 和 `summarize()` 一起被覆盖——`memory.py` 那边有一处绕过 `send` 直接调 `client.messages.create` 的,也照样管得住。
 
-> 当前模型接入的是 MiniMax-M2.7,`base_url=https://api.minimaxi.com/anthropic`,走 Anthropic 兼容协议,所以 `llm.py` 用的是官方 `anthropic` SDK。
+**2026-09-20 接入流式之后,上面这条"代价"按路径分裂了**,别再当成一个数看:
+
+- **走了流式的**(只有主agent,即 `send()` 给了 `on_thinking` 的那些):120 秒管的是「两个 chunk 之间」的间隔(httpx 的 stream 是裸 chunk 迭代器,httpcore 的 `read(max_bytes, timeout)` 按次计),所以**整段生成多久都不会被误杀**——上面那条代价在这条路上基本消失了;
+- **没走流式的**(子agent / 团队成员 / 定时任务 / `summarize()`):原样,120 秒仍是整段上限,该被误杀还是会被误杀。
+
+这个不对称是**已知的**,不是漏改。哪天要让所有路都吃上,再把 `on_thinking` 铺开。
+
+> 模型接入的是第三方 Anthropic 兼容端点(`base_url` + `MODEL_ID` 都从 `.env` 读,所以**具体是哪家会随 `.env` 变,以 `.env` 为准**),因为对方走 Anthropic 兼容协议,`llm.py` 用的才是官方 `anthropic` SDK。
+>
+> (这一行的前身写死了「MiniMax-M2.7 + api.minimaxi.com」,2026-09-20 查 `.env` 时发现早已不是——当时是 `deepseek-flash` + `api.deepseek.com/anthropic`。端点换过,文档没跟上。**流式能不能用是随端点走的**:接入时实测过一家支持 SSE,换端点后要重测,办法见 `_a2_spike/spike_stream_endpoint.py`。)
 
 **配套:主对话的失败兜底**(`main.py` 的 `run_turn`)。`user_loop` 的两处 `run()` 调用都包在它里面:失败时打一句「这一轮失败了,已经中断 + 原因」和「会话还在,可以直接重说一次」,**会话不死**。
 

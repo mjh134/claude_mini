@@ -203,10 +203,21 @@ class ClaudeMini():
             team_message = self.collect_team_messages()
             if team_message:
                 history.append(team_message)
+            #流式思考的活行。★ 只有主agent建得起:show_thinking 全项目只有
+            #main.py 传了 True,而子agent/团队成员/定时任务都是默认的 False ——
+            #所以进程里最多一条活行,不存在两个 agent 抢同一行的问题
+            live = ui.thinking_live() if self.show_thinking else None
             #发送消息
             try:
-                response = self.llm.send(history)
+                response = self.llm.send(
+                    history,
+                    on_thinking=(live.feed if live is not None else None),
+                )
             except Exception as e:
+                #★ 必须先把活行收掉。不然:① 错误信息会打在"思考中…"那条**没换行**的行上,
+                #挤成一团;② 那一行永远等不到换行,后面所有输出都跟着乱
+                if live is not None:
+                    live.abort()
                 text = str(e).lower()
                 too_long = any(k in text for k in
                                ("prompt_too_long", "prompt is too long", "too many tokens"))
@@ -230,13 +241,20 @@ class ClaudeMini():
                         #思考交给 ui 折叠:默认只出一行"思考 N 行",想看整段再开
                         #UI_VERBOSE=1。以前是把整段 thinking 直接糊上来,
                         #它经常比正文还长,一屏正文全被它顶出去了
-                        ui.thinking(block.thinking)
+                        #live 给过去 = 流式时那一行**已经在了**,就地换成这一行,
+                        #不再另打一行(否则屏幕上会出现两条"思考 N 行")
+                        ui.thinking(block.thinking, live=live)
                     else:
                         continue
                 elif block.type == "text" :
                     if self.slient:
                         ui.assistant(block.text)
                     final_text += block.text
+
+            #一个思考块都没出(简单问题直接答、纯工具调用)时,活行没人认领 ——
+            #得把那一行让回给提示符。已定格的会自己 no-op,所以无条件调
+            if live is not None:
+                live.abort()
 
             if final_text:
                 last_text = final_text

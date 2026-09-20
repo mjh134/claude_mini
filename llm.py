@@ -18,8 +18,17 @@ import ui
 #120 秒 ×3 次把最坏情况压到 6 分钟,而且失败会**抛出来**:异常一抛,线程就结束了,
 #task_runner._run_agent 的 except BaseException 接住它,失败通知和名额归还都是现成的路。
 #
-#代价:模型偶尔真的要生成超过 120 秒时会被误杀(非流式请求,8192 tokens)。
+#代价:模型偶尔真的要生成超过 120 秒时会被误杀(8192 tokens)。
 #真遇到了就调大这一个数,别的都不用动
+#
+#★ 2026-09-20 加流式之后,这个"代价"**按路径分裂**了,别当成一个数看:
+#  · 走了流式的(只有主agent,即 send() 给了 on_thinking 的那些)—— 120 秒管的是
+#    "两个 chunk 之间"的间隔(httpx 的 stream 是裸 chunk 迭代器,httpcore 的
+#    read(max_bytes, timeout) 按次计),所以**整段生成多久都不会被误杀**。
+#    上面那条"误杀"的代价在这条路上基本消失了
+#  · 没走流式的(子agent/团队成员/定时任务/summarize)—— 原样,120 秒仍是整段上限,
+#    该被误杀还是会被误杀
+#这个不对称是**已知的**,不是漏改。哪天要让所有路都吃上,再把 on_thinking 铺开
 LLM_TIMEOUT_SECONDS = 120
 #建连单独给一个小值:timeout=120 会把 connect 也一起变成 120(默认才 5 秒),
 #于是"base_url 写错"这种本来 5 秒就报的错要拖两分钟 —— 那是净退步
@@ -159,7 +168,18 @@ class LLM:
         self.system_prompt = system_prompt
         self.tools = tools
 
-    def send(self, history):
+    def send(self, history, on_thinking=None):
+        """发一次请求。on_thinking 给了就走流式,思考增量边收边喂给它。
+
+        **为什么做成可选而不是"一律走流式"**:流式会改掉超时的含义(见下面那段),
+        而这个项目里 send() 的调用方有五种身份(主agent、子agent、团队成员、定时任务、
+        以及 summarize)。只让主agent吃这个变化,别的一条路都不动 ——
+        on_thinking=None 时走的就是原来那句 create(),逐字节一致。
+
+        实测(2026-09-20,deepseek-flash):一次 135 字的思考吐了 **95 个 thinking_delta**,
+        平均一个事件才 1.4 个字。所以喂进来的增量会非常碎,消费方**必须自己节流**,
+        不能来一个画一次。
+        """
 
         #控制字节在**这一处**拦掉(理由见 _scrub_history 上面那段)。
         #命中要报出来,而且要用 warn 不是 debug:它意味着有东西正往模型上下文里灌,
@@ -172,13 +192,34 @@ class LLM:
 
         self._dump_request(history, hits)
 
-        return self.client.messages.create(
+        kwargs = dict(
             model=self.model_id,
             max_tokens=8192,
             system=self.system_prompt,
             tools=self.tools,
             messages=history
         )
+
+        if on_thinking is None:
+            return self.client.messages.create(**kwargs)
+
+        #★ 流式之下,120 秒超时的含义变了:非流式时它是"整段生成"的上限,
+        #流式时它是"两个 chunk 之间"的上限(httpx 的 stream 是裸 chunk 迭代器,
+        #httpcore 的 read(max_bytes, timeout) 按次计)。**这其实是好事** ——
+        #真跑长任务不会再被误杀。但这个变化**只覆盖走这条路的主agent**;
+        #子agent/成员/定时任务仍是"整段 120 秒",该被误杀还是会被误杀。
+        #这个不对称是已知的,别当成 bug 去"修"。
+        #
+        #另注:断了重连的活 SDK 不干(响应已经开始,没法重放),所以
+        #max_retries 在这条路上只对"建连阶段"有效。这是流式的固有代价,不是配置问题
+        with self.client.messages.stream(**kwargs) as stream:
+            for event in stream:
+                if event.type == "content_block_delta" and event.delta.type == "thinking_delta":
+                    on_thinking(event.delta.thinking)
+            #get_final_message() 攒出来的仍是完整 Message(content 块类型和 create()
+            #返回的一模一样),所以 claude.py 那边 history.append 一个字都不用改。
+            #实测返回的是 ParsedMessage —— 已经验过:它照样能塞回 history 再发出去
+            return stream.get_final_message()
 
     def _dump_request(self, history, hits):
         """UI_VERBOSE=1 时把**这一请求原样**落盘,覆盖上一份。

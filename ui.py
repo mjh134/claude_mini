@@ -58,6 +58,13 @@ from rich.text import Text
 #下面这几行保持最朴素的写法:不要在这里自己开 VT、也不要按"输出对象认不认 ANSI"
 #去关 rich 的颜色 —— 那些都是我照错误方向加的东西,已撤掉(raw=True 之后它们既没用,
 #还会在启动时改控制台模式)
+#
+#(2026-09-20 补:同一条链上还埋着第二个坑,在**流式思考的活行**那里 —— 归位原来用 `\r`,
+# 现象是计数器往后堆、屏幕上却没有半点乱码。查下来 rich 确实会把 CR 剥掉
+# (strip_control_codes 表里有 13),**但剥掉不是真因**:绕开 rich 单独写 `\r`、
+# 确认它和文字拼进了同一批、也确认写进了终端,它还是不生效 —— 是终端那层吞的。
+# 现在归位改用 `\x1b[G`,详情见下面 _live_write。这个和上面那个是两码事:
+# 那个是"输出层把 ESC 换成了 ?",这个是"终端不认 CR")
 # 文件名从 rich 的语义里拿,不重名
 console = Console()
 
@@ -223,7 +230,26 @@ _COMMANDS = (
 
 
 def run_command(line):
-    """处理一条斜杠命令。**认领了返回 True,认不出返回 False(交给模型)**"""
+    """处理一条斜杠命令。**认领了返回 True,认不出返回 False(交给模型)**
+
+    ★ 整条命令当**一段**让位出去,不是一处一处让:斜杠命令几乎都是连打几行的
+    (/帮助 一打就是十几行),一行一行让会变成"换行/打一行/重画"×N,中间还会被
+    feed 挤进来把块拆散。包在这儿,块是完整的,重画只发生一次。
+
+    调用方是**读线程**(main.py 敲完回车那条),而活行归主循环线程 —— 用户完全
+    可能在主agent还在思考时敲 /展开,这就是这条路径存在的理由。
+    """
+    live = _ACTIVE_LIVE
+    if live is None or not live.alive:
+        return _run_command(line)
+    box = []
+    live.yield_for(lambda: box.append(_run_command(line)))
+    return box[0]
+
+
+def _run_command(line):
+    """run_command 的实体。★ 里面只许用 console.print,不许用 _print_yielding ——
+    整个函数体已经在让位区间里了,再让一次就会在块中间凭空多出换行"""
     parts = str(line).strip().split()
     if not parts:
         return False
@@ -305,8 +331,11 @@ PROMPT_ANSI = "\x1b[1;35m▌ \x1b[0m"
 def assistant(md):
     """助手正文。默认当 markdown 渲染 —— 模型本来就爱出 markdown,
     以前是原样吐出来,星号全糊在屏幕上"""
-    console.print(Text("  助手", style="bold green"))
-    console.print(_md(md))
+    #★ 走 _print_yielding 而不是 console.print:团队成员在自己的线程里出正文时,
+    #主agent的活行可能正占着最后一行(子agent这条路正常撞不上 —— 思考块总在正文块前面,
+    #轮到正文时活行早定格了。这是给"以后加了新的块顺序"留的保险,不是现在就在救火)
+    _print_yielding(Text("  助手", style="bold green"))
+    _print_yielding(_md(md))
 
 
 def _md(md):
@@ -321,13 +350,16 @@ def _md(md):
         return Text(str(md))
 
 
-def thinking(text, lines=None):
+def thinking(text, lines=None, live=None):
     """思考。默认折成一行,**想看再 /展开**。
 
     折叠而不是整段打出来,是因为思考经常比正文还长;但它又必须**可见**
     (模型在想什么,是判断它跑没跑偏的主要依据),所以留一行摘要。
     全文进折叠登记处 —— 这条 docstring 以前就写着"想看再展开",但那条路当时
     并不存在(只能 UI_VERBOSE=1 重开进程),现在补上了
+
+    live:流式时那条正在原地刷新的活行(见 thinking_live)。给了就**就地换成**
+    这一行,不再另打一行 —— 不然屏幕上会出现两条"思考 N 行"
     """
     if text is None:
         return
@@ -335,9 +367,240 @@ def thinking(text, lines=None):
     _fold("思考", "", f"思考 {n} 行", text)
     t = Text("  › 思考 ", style="dim italic")
     t.append(f"{n} 行", style="dim")
-    console.print(t)
+
+    #流式的时候这一行**已经在了**(活行原地刷了整段思考),finish 会把它就地换成
+    #下面这一行 —— 再 console.print 一次就会打出台词重复的第二行
+    if live is None or not live.finish(t):
+        console.print(t)
+
     if UI_VERBOSE:
         console.print(Text(_clip(str(text)), style="dim"))
+
+
+#---------------------------------------------------------------------------
+#流式思考的"活行":同一个位置原地刷新,收尾时换成定格行
+#---------------------------------------------------------------------------
+#★ 这是本项目**第一处**"不带换行往终端写"的代码。以前 30 处 console.print 全是默认
+#end="\n",整个 ui.py 是纯粹的整行输出层。所以这段值得写清楚它凭什么能work。
+#
+#能穿过去靠的是 rich 每次 _write_buffer 结束都**无条件** flush()(rich/console.py:2116),
+#而 patch_stdout 的 flush() 会把"按 \n 切分攒着"的缓冲投递出去(patch_stdout.py:268)。
+#换句话说:**不带换行的写入必须 flush 才出得来**;裸 sys.stdout.write() 会被扣在
+#缓冲里(patch_stdout.py:244),别改成那种写法。
+#
+#两条物理限制,不是 bug,别去"修":
+#  · 刷新率上限约 5 次/秒 —— patch_stdout 每批 sleep 0.2(patch_stdout.py:184,
+#    它构造时写死的)。patch_stdout(raw=True) 这个签名里**没有** sleep_between_writes,
+#    当前 API 改不了,要改得自己造 StdoutProxy 绕开它 —— 那会掀掉刚修好的 raw=True
+#  · 每批一次完整的 erase → cooked_mode → write_raw → CPR 查询 → _redraw
+#    (run_in_terminal.py:92-112),代价在"批"数上,不在字节量上
+#所以喂进来的增量再碎也没用,该节流还得节流:实测一次 135 字的思考吐 **95 个**
+#thinking_delta,平均一个事件 1.4 个字。不节流就是一秒几十次重画。
+_LIVE_MIN_INTERVAL = 0.15
+
+#当前活着的那条活行(全局最多一条,见 thinking_live)。**别的线程**要往屏幕上打东西时,
+#靠它找到"现在是谁占着最后那一行",好把行让出去再重画回来(见 _print_yielding)。
+#没有活行时是 None —— 那种情况下打印路径**和流式改造前一模一样**。
+#不用手动清:收场之后 alive/_shown 都是 False,_print_yielding 看一眼就绕过去了
+_ACTIVE_LIVE = None
+
+
+class _LiveLine:
+    """一行原地刷新的思考提示。**整个进程里最多只有一个**(见 thinking_live)。
+
+    生命周期:feed 若干次 → finish(就地换成"思考 N 行")或 abort(擦掉,什么也不留)。
+
+    ★ 这个类**有锁,而且必须有**。这里原来写的是"不加锁,feed/finish/abort 全在调
+    llm.send() 的那一个线程里跑" —— 那个前提**已经不成立了**:后台子agent、团队成员
+    各在自己的线程里调 ui.status / ui.tool_call,那些写入会撞上主agent正在刷的活行。
+    锁要护住两件事:
+      · 活行自己的写(feed/finish/abort/redraw)是原子的,不会两条写交叉;
+      · 别人插进来打一整段(让位 → 打 → 重画)也是原子的,中途不会被 feed 挤进去。
+    ★ 锁序**只有一条**:先 self._lock,再 rich Console 内部的 RLock(_live_write 走的
+    console.print 只拿后者)。反过来"先 console 再 live"的路径一条都没有 ——
+    别新开一条反向的,那才会死锁。
+
+    ★ 让位只在**屏幕上真有这一行**的时候才让(self._shown):thinking_live() 是在发请求
+    **之前**就把句柄建好的,而第一个思考增量可能几十秒后才来。这中间子agent要是打了一行,
+    屏幕上根本没有活行可让 —— 补个换行就是凭空白出一行。
+    """
+
+    def __init__(self, live):
+        global _ACTIVE_LIVE
+        self.alive = live      #非交互(管道/重定向)时是 False,所有方法直接变哑
+        self.n = 0
+        self._t = 0.0
+        self._lock = threading.RLock()
+        self._last = None      #最后一次画上去的那行,让位之后要照原样重画回来
+        self._shown = False    #屏幕上此刻是不是真有这一行
+        if live:
+            _ACTIVE_LIVE = self
+
+    def _redraw(self):
+        """把最后一次画的那行原样重画回去(让位之后用)"""
+        if self._last is not None:
+            _live_write(self._last)
+
+    def yield_for(self, write):
+        """把最后一行让给 write(),打完**立刻**把活行重画到新的一行上。
+
+        为什么不让 write() 直接盖上去:它打的是一整行(可能还不止一行),长短不一,
+        盖完光标就回不来了 —— 计数器会停在原地不动,直到下一次 feed 才自愈。
+        让位 + 重画之后计数器是**不断档**的:
+
+              › 思考中… 137 字
+              · 🤖 子agent 开始:看看当前目录有什么文件
+              › 思考中… 137 字        ← 立刻重画,中间没有空档
+              › 思考中… 274 字
+
+        代价:一次让位 = 3 个代理批(换行 / 写入 / 重画)= 3 次 erase+redraw。
+        只在真有东西插进来时才付,正常跑一次流式是 0 次。
+        """
+        with self._lock:
+            if not self.alive or not self._shown:
+                write()
+                return
+            console.print()             #★ 先补个换行,把这一行**让出去**
+            try:
+                write()
+            finally:
+                self._redraw()          #★ 让完立刻重画,不断档
+
+    def feed(self, delta):
+        """收到一段思考增量。节流在这里做,调用方不用管"""
+        with self._lock:
+            if not self.alive:
+                return
+            self.n += len(delta)
+            #用 monotonic 不用 time.time():后者会被系统时钟跳变影响,而这里量的是间隔
+            now = time.monotonic()
+            if now - self._t < _LIVE_MIN_INTERVAL:
+                return
+            self._t = now
+            t = Text("  › 思考中… ", style="dim italic")
+            t.append(f"{self.n} 字", style="dim")
+            t.append("\x1b[K")          #擦到行尾:计数器变短时(如 1000→999)不留残字
+            self._last = t              #留一份,让位完照着它重画
+            self._shown = True
+            _live_write(t)
+
+    def finish(self, t):
+        """把活行就地换成最终那一行,然后换行。返回是否真的接管了。
+
+        返回 False = 这条活行没被用过(或已经收场了),调用方照常自己 print
+        """
+        with self._lock:
+            if not self.alive:
+                return False
+            self.alive = False
+            self._shown = False
+            final = Text()
+            final.append_text(t)        #把 thinking() 拼好的那行原样接过来,样式不丢
+            final.append("\x1b[K")
+            _live_write(final)
+            console.print()             #★ 换行:不换行的那一段到此为止
+            return True
+
+    def abort(self):
+        """没收场就收场:把这一行**原样让回给提示符**。
+
+        只擦、不换行 —— 光标停在行首,正好是提示符该在的位置,上面不会留个空行。
+        抛异常(网络断、prompt 过长)和"一个思考块都没出"两种情况都走这里
+        """
+        with self._lock:
+            if not self.alive:
+                return
+            self.alive = False
+            self._shown = False
+            _live_write(Text("\x1b[K"))
+
+
+def _live_write(t):
+    """不带换行地往终端写一段:先把光标拽回第 1 列,再打这一批。
+
+    ★ 全项目唯一一处这种写法,别在别处照抄。
+
+    ★★ 归位为什么用 `\\x1b[G`(CHA),而不是 `\\r` —— 这是**实测踩出来的**。
+
+    先讲清楚**已经排除掉的**:不是"rich 把 `\\r` 剥了、导致两次 write 分了家"。
+    `\\x1b[G` 确实一举解决了"`\\r` 进不了 Text"的问题(`Text.append` 会过
+    `strip_control_codes`,那张表是 `[7, 8, 11, 12, 13]`,**13 就是 `\\r`**;
+    ESC(27)不在表里,所以 `\\x1b[K` 一路活得好好的),但这个解释**不足以定案** ——
+    下面这份证据把它否掉了。
+
+    ★ 证据(_a2_spike/spike_live_bytes.py,在 rich→代理→终端 三级各挂一个记录点):
+
+        1 raw    | '\\r'
+        1 raw    | '\\x1b[2;3m  › 思考中… 111 字\\x1b[K\\x1b[0m'
+        2 batch  | '\\r\\x1b[2;3m  › 思考中… 111 字\\x1b[K\\x1b[0m'   ← 拼进同一批了
+        3 终端   | '\\x1b[?7h\\r\\x1b[2;3m  › 思考中… 111 字\\x1b[K\\x1b[0m'  ← 到终端了
+
+    也就是说:即使绕开 rich 单独写 `\\r`,它**照样和文字落进同一批、照样到了终端**,
+    可屏幕上就是不动 —— 计数器一路往后堆,而且**一个乱码都没有**(`\\r` 没生效不显形,
+    `\\x1b[K` 在文字末尾也擦不到东西)。换成 `\\x1b[G` 之后现象消失。
+
+    **结论:`\\r` 是在终端(Windows conhost)那一层被吞的,不在 Python 这一侧。**
+    至于 conhost 为什么吞它 —— **没有定论,不编**。当时的控制台模式是
+    `0x0007`(PROCESSED_OUTPUT|WRAP_AT_EOL|VT 都在,`ENABLE_PROCESSED_OUTPUT`
+    是开的,按文档 `\\r` 该被当回车),flush 期间 `Windows10_Output` 临时改成
+    `0x0005` 也仍然带着那一位。所以"模式不对"解释不了,别顺着这条往下猜。
+
+    → 选 `\\x1b[G` 的**可靠理由**不是上面那条推理,而是这两条:
+      1. 它和颜色码(`\\x1b[2;3m`)是同一类 CSI 序列,而颜色码在这台机器上**确认能用**
+         (那个 `?[2;3m` 的真因是 patch_stdout 把 ESC 换成了 `?`,不是终端不认);
+      2. 它是 ESC 序列,不在剥离表里,能**直接写进 Text**,和文字同一次 write 出去 ——
+         于是"归位和文字必须同批"这件事不再依赖任何跨 write 的保证。
+
+    (还试过 rich 自己的 `Control.home()`:非终端控制台下它一个字节都不出,不能用。)
+
+    no_wrap / overflow / crop 三个一起给:活行一旦被 rich 折出 `\\n`,
+    patch_stdout 就会把它当成一条完整消息投递,原地刷新当场散架
+    """
+    #归位序列**拼进 Text**,不单独 write —— 见上面第 2 条,同一次 write 才保证同批
+    out = Text()
+    out.append("\x1b[G")
+    out.append_text(t)
+    console.print(out, end="", no_wrap=True, overflow="ignore", crop=True)
+
+
+def _print_yielding(*args, **kw):
+    """`console.print` 的替身:要是有活行占着屏幕,先让位、打完**立刻**重画。
+
+    为什么渲染入口都得过这一道:活行是**不带换行**写在最后一行上的,别的线程这时候
+    console.print 一行,就会**粘在计数器前面** ——
+
+        |  › 思考中… 200 字  · 🤖 子agent 开始:看看当前目录有什么文件
+
+    那一行一半是活的、一半是死的,既难看又读不出来。走这里就规规矩矩变成两行(见 yield_for)。
+
+    ★ 没有活行时**它就是 console.print 本身**,一个字节都不多:管道/重定向、
+    子agent独立跑、定时任务、非交互 —— 这些路径的行为和流式改造前完全一致。
+
+    ★ 这里**必须**直接调 console.print 而不是再套一层,否则 _live_write 会绕回自己
+    """
+    live = _ACTIVE_LIVE
+    if live is None or not live.alive:
+        console.print(*args, **kw)
+        return
+    live.yield_for(lambda: console.print(*args, **kw))
+
+
+def thinking_live():
+    """开一条流式思考的活行。不能刷的时候返回哑句柄(方法全是空转)。
+
+    ★ 为什么天然只可能有一个:全项目只有 main.py:106 传了 show_thinking=True ——
+    定时任务(dispatcher.py:104)传的是 slient=False + role=ROLE_MAIN,**没传**
+    show_thinking,所以是 False。而活行只在 show_thinking 为真时才建。
+    于是进程里最多一个持有者。★ 但也**仅此而已** —— "最多一个"不代表"只有创建它的
+    那条线程碰它":子agent在自己线程里打印时会经 _print_yielding 找到它、让它让位。
+    所以互斥还是得有,锁在 _LiveLine 里。
+    顺带说清:slient **不是**合适的判据 —— 它管的是"子agent消息展不展示",和这个无关
+    (而且它的名字和注释都是错的,那是另一件事)。
+
+    判据用 PT_ACTIVE 而不是 sys.stdout.isatty():PT_ACTIVE 恰好就是
+    "读线程已接管终端、patch_stdout 生效中",这才是活行能工作的前提(定义在下面反问那节)
+    """
+    return _LiveLine(PT_ACTIVE.is_set())
 
 
 def _clip(s, limit=None):
@@ -416,7 +679,9 @@ def tool_call(name, args="", who=None, full=None):
     t.append(str(name), style="bold bright_cyan")
     if shown:
         t.append("  " + shown, style="dim")
-    console.print(t)
+    #★ 子agent/团队成员的工具调用从**它们自己的线程**打出来,正好会落在主agent
+    #思考的中途 —— 这是最常见的撞车点。让位 + 重画,别粘在计数器前面
+    _print_yielding(t)
 
 
 def tool_result(brief, ms=None, who=None):
@@ -449,16 +714,16 @@ def tool_result(brief, ms=None, who=None):
     t.append(shown, style="yellow" if failed else "dim")
     if ms is not None:
         t.append(tail, style="dim italic")
-    console.print(t)
+    _print_yielding(t)
 
 
 def error(text):
     """出错。亮红 —— 这是对话级,用户必须看见"""
-    console.print(Text("  ✗ " + str(text), style="bold red"))
+    _print_yielding(Text("  ✗ " + str(text), style="bold red"))
 
 
 def warn(text):
-    console.print(Text("  ⚠ " + str(text), style="yellow"))
+    _print_yielding(Text("  ⚠ " + str(text), style="yellow"))
 
 
 def status(text, fold=None):
@@ -471,13 +736,13 @@ def status(text, fold=None):
     """
     if fold is not None:
         _fold(fold[0], "", fold[1], fold[2])
-    console.print(Text("  · " + str(text), style="dim"))
+    _print_yielding(Text("  · " + str(text), style="dim"))
 
 
 def debug(text):
     """调试级:[bus] [scheduler] [mcp] 这些。默认整段不显示"""
     if UI_VERBOSE:
-        console.print(Text("      " + str(text), style="grey35"))
+        _print_yielding(Text("      " + str(text), style="grey35"))
 
 
 def banner(lines):
