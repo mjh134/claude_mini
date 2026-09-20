@@ -5,9 +5,8 @@ from TOOLS import (Tools, create_default_registry, tool_filter, check_roles,
                    ROLE_MAIN, ROLE_SUBAGENT, ROLE_MEMBER, ROLE_DENIED, ROLE_HINT,
                    JOB_TOOLS)
 import HOOKS
-from PROMPT import SYSTEM_PROMPT
+from PROMPT import build_system_prompt, check_prompts
 from PROMPT import SUBAGENT_PROMPT
-from PROMPT import TEAM_MEMBER_PROMPT
 from PROMPT import OFFLINE_CONFIRM_PROMPT
 from skill import  SkillLoader
 from compact import CompactManager
@@ -108,17 +107,26 @@ class ClaudeMini():
         _now = datetime.now()
         current_time = f"\n当前时间:{_now.strftime('%Y-%m-%d %H:%M')} 周{'一二三四五六日'[_now.weekday()]}"
 
+        #★ 按角色取提示词 —— 成员和子agent**拿不到**主agent那套"怎么派活、怎么管定时任务"
+        #的说明。以前是"所有人先拿主agent那份,成员再追加一段纠偏",模型读到的是完整的
+        #主agent说明,补的那句压不住它(实测:成员照着「怎么组建团队」去做,还谎报
+        #"已启动成员",见 9b37de0)。这里和 tool_filter(role) 认的是**同一个 role 值** ——
+        #"给哪段提示词"和"给哪些工具"至此才真的合成一套
+        head = build_system_prompt(role)
         if session_memory:
-            self.system_prompt = SYSTEM_PROMPT + "\n" + session_memory + current_time + "\n" + "你可以使用以下skill解决相关问题:\n" + self.skill_loader.catalog()
-        else:
-            self.system_prompt = SYSTEM_PROMPT + "\n" + current_time + "\n" + "你可以使用以下skill解决相关问题:\n" + self.skill_loader.catalog()
+            head = head + "\n" + session_memory
+        self.system_prompt = head + current_time + "\n" + "你可以使用以下skill解决相关问题:\n" + self.skill_loader.catalog()
 
-        #团队成员看到的规则和主agent不同(不能建团队、不能自己退出、要如实做下线确认),
-        #不清不楚会让它照主agent的说明去"组建团队"甚至谎报结果(测试报告·问题6)。
-        #这里用的是**同一个 role** —— 以前"给哪段提示词"和"给哪些工具"是两套并行机制,
-        #各写各的、会互相漂移;现在合成一套
-        if role == ROLE_MEMBER:
-            self.system_prompt += "\n" + TEAM_MEMBER_PROMPT
+        #提示词自检:每个角色看到的那份里点名的工具,必须在它自己的工具表里。
+        #和 check_roles 一样只在主agent上跑一次 —— 但**三个角色都查**:主agent是启动时
+        #唯一确定会被建出来的实例,成员/子agent要等真派活了才存在,那时候再发现就晚了。
+        #(不查"拥有但没提"那个方向:工具描述自己讲得清怎么用,提示词没提不算错)
+        if role == ROLE_MAIN:
+            _universe = {t["name"] for t in schemas}
+            for _r in (ROLE_MAIN, ROLE_MEMBER, ROLE_SUBAGENT):
+                _owned = {t["name"] for t in tool_filter(schemas, ROLE_DENIED[_r])}
+                for problem in check_prompts(_r, build_system_prompt(_r), _owned, _universe):
+                    ui.warn(f"[prompt] {problem}")
 
         self.llm = LLM(self.system_prompt,self.tools)
 
