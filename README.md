@@ -56,11 +56,11 @@ python main.py
 ## 文档
 
 - `PROJECT_REPORT.md`——完整实现说明，按子系统讲设计和踩过的坑
-- `提示词精简清单.md`——提示词删掉的 40 句各去了哪
-- `版本控制.md`——git 用法，以及这个仓库的两条铁律（`.env` 不进库、`autocrlf=false`）
 
 ## 说明
 
 这是个实验性质的项目，优先保证机制齐全和可读，没做工程化打磨：出错大量用「返回字符串」而不是抛异常，中文变量名和一些拼写错误（`slient`、`compact_mannager`）都原样留着。
 
 `SKILLS/` 里有两个示例 skill。`mcp_servers.json` 默认只挂一个自带的 demo 服务器。
+
+**克隆到别的机器后记得设一次 `git config core.autocrlf false`。** 这个仓库的行尾是故意不统一的（`.py` 有 CRLF 也有 LF），不设的话 checkout 时会被静默改写。这条配置是本地的，没跟仓库一起提交。
