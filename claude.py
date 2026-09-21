@@ -52,9 +52,6 @@ class ClaudeMini():
         self.compact_mannager = CompactManager()
         self.memory_manager = MemoryManager()
 
-        #后台执行器:和 Scheduler / TaskStore / MCP 一样是**共享服务**。
-        #结果邮箱必须是同一个 —— 谁自己建一个,它提交的后台任务结果就会落进那份
-        #没人读的邮箱,永远送不回主对话。所以子agent也共享同一个实例(见 _build_subagent)
         self.task_runner = task_runner if task_runner is not None else TaskRunner()
 
         #谁是这份邮箱的收件人。两种情况:
@@ -66,8 +63,7 @@ class ClaudeMini():
         #   两种从参数上看不出来,所以默认选"不收":忘了标只是少一条通知,标错了是通知跑到别人家去
         self.drains_results = (task_runner is None) if drains_results is None else drains_results
 
-        #身份:决定这个 agent 拥有哪些工具(表在 TOOLS.py 的 ROLE_DENIED)。
-        #角色管的是"这个身份有没有这个工具",和"这次调用的参数允不允许"(PERMISSIONS)是两回事
+        #角色决定能调用的工具
         self.role = role
         #deny_tools 是调用方追加的禁用名单,叠在角色之上。
         #给的是**名字集合**不是角色(和 tool_filter 同一个约定):禁的理由不一定来自身份,
@@ -232,7 +228,7 @@ class ClaudeMini():
                 if not too_long or reactive_retries >= 1:
                     raise
                 ui.status("[reactive compact] prompt过长,压缩后重试")
-                history = self.compact_mannager.reactive_compact(history, self.llm)
+                history[:] = self.compact_mannager.reactive_compact(history, self.llm)
                 reactive_retries += 1
                 continue
             reactive_retries = 0
@@ -277,12 +273,7 @@ class ClaudeMini():
 
             #没有工具调用需求退出循环
             if not tool_calls:
-                #后台任务**不在这里等**
-                #原来这里是 wait_background_tasks(timeout=300):模型停手后阻塞等后台跑完,
-                #再 continue 把结果收进来。那是"同一轮内并发" —— 好处是结果当场就报给用户,
-                #代价是这一轮最长被占住 300s,而且超时就再也收不到(要等下一次 run())。
-                #现在改成真异步:立刻返回,后台跑完了由 main.py 的 user_loop 唤醒,
-                #在**新一轮**的开头被 collect() 领走,包成 <task_notification> 进对话
+                #后台任务不在此处等待
                 return last_text  #返回子agent最后一轮执行结果(最后一轮无正文则退回上一轮)
             
             #调用本轮工具
@@ -306,10 +297,10 @@ class ClaudeMini():
             })
 
             #压缩消息数量
-            history = self.compact_mannager.snip_compact(history)
+            history[:] = self.compact_mannager.snip_compact(history)
 
             #模型总结上下文
-            history = self.compact_mannager.llm_compact(history,self.llm)
+            history[:] = self.compact_mannager.llm_compact(history,self.llm)
 
     #agent teams
     # 成员的生命周期:idle(真阻塞) → work → idle ... 直到主agent请求下线并完成最终确认
