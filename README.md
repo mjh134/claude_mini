@@ -1,6 +1,6 @@
 # ClaudeMini
 
-用 Python 手写的迷你代码 Agent。
+用 Python 手写的迷你代码 Agent，具体代码大部分由ai实现
 
 没用 LangChain 之类的框架，主循环、工具表、上下文压缩、权限钩子都是自己实现的。目的是把 Claude Code 里那些在内部跑、平时看不见的东西，拆成一个个能读懂也能改的 Python 模块。
 
@@ -32,8 +32,6 @@ pip install anthropic python-dotenv prompt_toolkit rich
 python main.py
 ```
 
-`.env` 已被 `.gitignore` 挡住，不会进仓库。
-
 ## 代码分布
 
 | 文件 | 干什么 |
@@ -59,7 +57,7 @@ python main.py
 
 ## 说明
 
-这是个实验性质的项目，优先保证机制齐全和可读，没做工程化打磨：出错大量用「返回字符串」而不是抛异常，中文变量名和一些拼写错误（`slient`、`compact_mannager`）都原样留着。
+这是个实验性质的项目，优先保证机制齐全和可读，没做工程化打磨
 
 `SKILLS/` 里有两个示例 skill。`mcp_servers.json` 默认只挂一个自带的 demo 服务器。
 
