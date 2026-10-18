@@ -1,4 +1,4 @@
-from pathlib import Path
+import paths
 from dotenv import load_dotenv
 import os
 import json
@@ -13,12 +13,11 @@ BACKUP_RETAIN_DEFAULT = 5           # 整理前快照最多保留几份(超出�
 
 
 class MemoryManager:
-    BASE_DIR = Path(__file__).resolve().parent
 
     def __init__(self):
-        load_dotenv(override=True)   # 项目 .env 永远赢,与 llm.py 同规矩:防 shell 里已 export 的同名变量遮住配置
+        load_dotenv(override=True)
         memory_dir = os.getenv("MEMORY_DIR", "memory")
-        self.memory_dir = self.BASE_DIR / memory_dir
+        self.memory_dir = paths.PROJECT_ROOT / memory_dir
 
         self.long_term_dir = self.memory_dir / "long_term"
         self.experience_dir = self.memory_dir / "experience"

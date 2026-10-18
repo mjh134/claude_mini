@@ -1,11 +1,10 @@
+import paths
 from dotenv import load_dotenv
 import os
-from pathlib import Path
 import json
 import ui
 
 class CompactManager():
-    BASE_DIR = Path(__file__).resolve().parent
     def __init__(self):
         load_dotenv()
         self.max_result_limit = int(os.getenv("MAX_RESULT_LIMIT"))
@@ -16,7 +15,7 @@ class CompactManager():
 
     #保存压缩的信息到文件
     def save_tool_result(self, tool_use_id, content):
-        path = self.BASE_DIR / self.tool_result_path
+        path = paths.PROJECT_ROOT / self.tool_result_path
         filepath = path / f"{tool_use_id}.txt"
         try:
             path.mkdir(parents=True, exist_ok=True)          
@@ -68,7 +67,7 @@ class CompactManager():
                 tail_start -= 1
             
         if tail_start -1> head_end:
-            path = self.BASE_DIR/self.transcript
+            path = paths.PROJECT_ROOT/self.transcript
             middle = messages[head_end:tail_start]
             try:
                 payload = json.dumps(
@@ -123,7 +122,7 @@ class CompactManager():
                 if len(content) <= 120:
                     continue
                 #tool_result_buget已存过原始完整内容,直接复用路径
-                filepath = self.BASE_DIR / self.tool_result_path / f"{block['tool_use_id']}.txt"
+                filepath = paths.PROJECT_ROOT / self.tool_result_path / f"{block['tool_use_id']}.txt"
                 if filepath.exists():
                     path = str(filepath)
                 else:
@@ -136,7 +135,7 @@ class CompactManager():
 
     #归档整段历史
     def save_history(self, history):
-        path = self.BASE_DIR / "history_backup.json"
+        path = paths.PROJECT_ROOT / "history_backup.json"
         try:
             with open(path, "w", encoding="utf-8") as f:
                 f.write(

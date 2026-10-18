@@ -1,14 +1,13 @@
+import paths
 from dotenv import load_dotenv
 import os
-from pathlib import Path
 import ui
 
 class SkillLoader:
-    BASE_DIR = Path(__file__).resolve().parent
     def __init__(self):
         load_dotenv()
            
-        self.dir = self.BASE_DIR/os.getenv("SKILL_DIR")
+        self.dir = paths.PROJECT_ROOT/os.getenv("SKILL_DIR")
         self.registry = {}
 
         self.scan()

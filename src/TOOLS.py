@@ -438,47 +438,31 @@ Tools = [
 ]
 
 #==================== 工具权限(角色) ====================
-#三层分工,别混:
-#  角色(这里)        —— 这个身份**拥有**哪些工具,构造时算一次
-#  tool_filter        —— 拥有的工具里,哪些真的进 self.tools(模型看得见)
-#  HOOKS/PERMISSIONS  —— 已拥有的工具,这次调用的**参数**放不放行(和身份正交)
-#
-#用**黑名单**:工具多、要禁的少,而且"禁"和原来那批 allow_* 开关是同一个语义方向
-#(allow_subagent=False 就是"禁 subagent"),属连续演化,不是语义反转。
 ROLE_MAIN = "main"
 ROLE_SUBAGENT = "subagent"
 ROLE_MEMBER = "team_member"
 
-#定时任务这 5 个:统一由主agent管。扫描线程和锁都不可复制,子agent建了会各扫各的。
-#只有"建/查/取消/恢复/删"这些**管理**动作 —— 到点执行不再由模型经手:
-#派发器自动取走任务、在独立后台 agent 里跑完、把结果汇报回 Scheduler(见 dispatcher.py)。
-#原来那两个 job_take / job_update_status 就是"模型自己领任务"的入口,已随旧设计删除
+#定时任务
 JOB_TOOLS = frozenset({"job_create", "job_list", "job_cancel", "job_resume",
                        "job_delete"})
 
-#团队这 5 个:要有消息总线、要有一张成员表才有意义。
-#子agent是一次性的、没有信箱,整组禁掉
+#agent team
 TEAM_TOOLS = frozenset({"send_message", "team_spawn", "team_list",
                         "team_stop", "team_offline_confirm"})
 
 ROLE_DENIED = {
-    #主agent拥有全部工具,只有一个本来就不该给它:
-    #下线确认是**成员**回答主agent用的。以前它只是没注册 handler,schema 却照样发给模型 ——
-    #模型看得见、一调就是 Unknown tool,正是这次要消灭的那种东西
+    #主agent拥有全部工具,除下线确认
     ROLE_MAIN: frozenset({"team_offline_confirm"}),
 
-    #子agent:禁再起子agent、禁写长期记忆、禁 recall_memory(防递归、防污染共享记忆库),
-    #禁定时任务,禁团队(它没有信箱,发出去也没人收)
+    #子agent:禁再起子agent、禁写长期记忆、禁 recall_memory,禁定时任务,禁团队
     ROLE_SUBAGENT: frozenset({"subagent", "recall_memory", "write_memory"}) | JOB_TOOLS | TEAM_TOOLS,
 
-    #成员:和子agent一样禁那几类,团队工具里只禁"写"的两个 ——
-    #发消息、看成员表、做下线确认都是它该有的(成员表的写权限只属于主agent,设计.md 十一)
+    #team成员
     ROLE_MEMBER: frozenset({"subagent", "recall_memory", "write_memory",
                             "team_spawn", "team_stop"}) | JOB_TOOLS,
 }
 
-#工具被拒时给模型的一句话说明。按**身份**说一次,而不是按工具重复 N 遍 ——
-#同一个理由(如"不能写长期记忆")在好几个工具上都成立,逐工具写就散了
+#工具被拒时给模型的一句话说明
 ROLE_HINT = {
     ROLE_MAIN: "",
     ROLE_SUBAGENT: ("你是子agent:不能起下级agent、不能写长期记忆、不能调 recall_memory、"
@@ -488,27 +472,13 @@ ROLE_HINT = {
                   "就说给主agent;查看团队用 team_list。"),
 }
 
-
+#过滤无权限工具
 def tool_filter(schemas, denied):
-    """把没权限的工具从工具表里摘掉。
 
-    只收"要摘掉的名字集合"、不收角色 —— 角色在调用方已经换算成集合了,
-    以后加角色这个函数不用动。
-
-    传进来的必须是**两个来源合并之后**的完整工具表:原生 schema 和 MCP schema 分开滤,
-    只滤其中一个,另一批会整批绕过。
-    """
     return [s for s in schemas if s.get("name") not in denied]
 
-
+#检查角色对应工具是否正确
 def check_roles(known):
-    """自检:角色表里写的名字必须真的存在。
-
-    黑名单最危险的失效方式不是"忘了禁某个新工具",而是**名字写错** ——
-    拼错的词不会报错,只是静默地什么都不禁,表现是"这工具怎么还能调",
-    而且没人会想到是表写错了。所以启动时对一遍。
-    只返回问题清单、不抛异常:表写错不该让整个项目起不来。
-    """
     known = set(known)
     problems = []
     for role, denied in ROLE_DENIED.items():
@@ -526,7 +496,17 @@ def run_calculate(expression):
         return "Error: Invalid expression"
 
 def run_bash(command, timeout=300, **_ignored):
-    output, _exit_code = execute_bash(command, timeout)
+    output, exit_code = execute_bash(command, timeout)
+    #★ 退出码原来是**丢掉**的(写成了 `_exit_code`),于是"这条命令失败了"这个维度
+    #  在模型眼里根本不存在 —— 一条 exit 1 的命令和一条成功的命令,返回给它的
+    #  是同一种东西:一段字符串。execute_bash 特意把 exit_code 算出来返回,白算了。
+    #
+    #  实测代价(2026-09-29 跑分):agent 批量拉 12 个远程文件,curl 存下来的其实是
+    #  24 字节的 404 错误页,它当成源码存进 src/ 继续往下推理。
+    #
+    #  ★ 只加后缀,成功的命令**一个字节都不变** —— 不为这一个场景动所有既有行为。
+    if exit_code != 0:
+        return f"{output}\n[⚠️ 退出码 {exit_code}:这条命令没有正常结束]"
     return output
 
     

@@ -29,10 +29,14 @@ pip install anthropic python-dotenv prompt_toolkit rich
 把 `.env.example` 复制成 `.env`，填上 `ANTHROPIC_API_KEY` 和 `ANTHROPIC_BASE_URL`（走 Anthropic 兼容接口，换供应商只改这两项），然后：
 
 ```
-python main.py
+python src/main.py
 ```
 
+**必须从项目根目录启动**：`.task/`、`llm_request.json` 这类运行态产物按进程工作目录落盘，换目录启动它们会散落到别处。
+
 ## 代码分布
+
+实现代码在 `src/` 下；`SKILLS/` 和长期记忆 `memory/` 在项目根（数据/资源归根、代码归 src，由 `src/paths.py` 的 `PROJECT_ROOT` 统一锚定）；`mcp_servers.json` 和 `mcp_demo_server.py` 留在 `src/`（MCP 按"配置文件所在目录"解析 args，要和 demo server 待在一起）：
 
 | 文件 | 干什么 |
 |---|---|
@@ -54,11 +58,12 @@ python main.py
 ## 文档
 
 - `PROJECT_REPORT.md`——完整实现说明，按子系统讲设计和踩过的坑
+- `DESIGN_NOTES.md`——设计决策与踩坑记录，按主题讲「为什么是这个样、以前错在哪」，内容取自代码注释并标了出处行号
 
 ## 说明
 
 这是个实验性质的项目，优先保证机制齐全和可读，没做工程化打磨
 
-`SKILLS/` 里有两个示例 skill。`mcp_servers.json` 默认只挂一个自带的 demo 服务器。
+`SKILLS/` 里有两个示例 skill。`src/mcp_servers.json` 默认只挂一个自带的 demo 服务器。
 
 **克隆到别的机器后记得设一次 `git config core.autocrlf false`。** 这个仓库的行尾是故意不统一的（`.py` 有 CRLF 也有 LF），不设的话 checkout 时会被静默改写。这条配置是本地的，没跟仓库一起提交。
