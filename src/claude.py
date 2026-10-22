@@ -21,6 +21,8 @@ from team import (TeamRuntime, KIND_CHAT, KIND_OFFLINE_REQ, KIND_OFFLINE_AGREE,
                   is_chat, is_control)
 import json
 import time
+import uuid
+import trace
 import ui
 
 #主agent发送下线请求时等候时间和重试轮次
@@ -149,6 +151,26 @@ class ClaudeMini():
         self._offline_decision = None   # 成员侧的最终确认结果:(agree, reason)
         self._offline_watch = {}
 
+        # --- 观测面 ---
+        self.trace = trace.get_trace()
+        #trace 里的显示名。前台子agent 的 agent_id 默认撞 "main"(见 _who 的注释),
+        #由 run_subagent 改成 sub-<hex>;只补观测面,不动身份系统(那是 P2 的事)
+        self.trace_name = self.agent_id
+        #本次 run() 的第几圈。任务级事件(task_runner)没有 turn,留 None
+        self.trace_turn = 0
+        #llm_request 的增量游标:history 前多少条已经记过
+        self.trace_logged_len = None
+
+    def trace_delta(self, history):
+        """llm_request 的载荷:首次全量,此后只记新增的尾巴。
+        压缩会原地重写 history(条数变短),游标可能越过头——那就重记一次全量,
+        标 resnapshot:回放拿它当新锚点,事件间不用做 diff"""
+        if self.trace_logged_len is None:
+            return {"mode": "full", "system_prompt": self.system_prompt,
+                    "messages": list(history)}
+        if len(history) < self.trace_logged_len:
+            return {"mode": "resnapshot", "messages": list(history)}
+        return {"mode": "delta", "messages": list(history[self.trace_logged_len:])}
 
     #agent循环
     def run(self,history):
@@ -160,6 +182,8 @@ class ClaudeMini():
 
         
         while True:
+            #重试圈也计数:重试次数正是"故障恢复"维度的原始数据,回放要看得见
+            self.trace_turn += 1
             #收集后台任务执行结果
             results = self.task_runner.collect() if self.drains_results else {}
             notification = self.build_task_notifications(results)
@@ -172,10 +196,17 @@ class ClaudeMini():
             live = ui.thinking_live() if self.show_thinking else None
             #发送消息
             try:
-                response = self.llm.send(
-                    history,
-                    on_thinking=(live.feed if live is not None else None),
-                )
+                with self.trace.span("llm_request", agent_id=self.trace_name,
+                                     turn=self.trace_turn) as s:
+                    s.set("messages_sent", self.trace_delta(history))
+                    response = self.llm.send(
+                        history,
+                        on_thinking=(live.feed if live is not None else None),
+                    )
+                    #只提 token 数:整 Usage 对象会被 sanitize 兜底转成 repr 字符串,好看不上
+                    usage = response.usage
+                    s.set("usage", {"input": getattr(usage, "input_tokens", None),
+                                    "output": getattr(usage, "output_tokens", None)})
             except Exception as e:
                 #★ 必须先把活行收掉。不然:① 错误信息会打在"思考中…"那条**没换行**的行上,
                 #挤成一团;② 那一行永远等不到换行,后面所有输出都跟着乱
@@ -187,13 +218,25 @@ class ClaudeMini():
                 if not too_long or reactive_retries >= 1:
                     raise
                 ui.status("[reactive compact] prompt过长,压缩后重试")
-                history[:] = self.compact_mannager.reactive_compact(history, self.llm)
+                with self.trace.span("compact", agent_id=self.trace_name,
+                                     turn=self.trace_turn) as s:
+                    s.set("layer", "reactive")
+                    s.set("before", len(history))
+                    history[:] = self.compact_mannager.reactive_compact(history, self.llm)
+                    s.set("after", len(history))
                 reactive_retries += 1
                 continue
             reactive_retries = 0
+            #游标推到"刚发出去多少":后面的压缩怎么重写 history 都不怕,变短会触发 resnapshot
+            self.trace_logged_len = len(history)
 
             #压缩模型查看过的工具调用结果
-            history = self.compact_mannager.micro_compact(history)
+            with self.trace.span("compact", agent_id=self.trace_name,
+                                 turn=self.trace_turn) as s:
+                s.set("layer", "micro")
+                s.set("before", len(history))
+                history = self.compact_mannager.micro_compact(history)
+                s.set("after", len(history))
 
             #最后一轮执行结果
             final_text = ''
@@ -246,7 +289,13 @@ class ClaudeMini():
                     }
                 
                 #压缩单次工具调用结果
-                tool_result = self.compact_mannager.tool_result_budget(tool_result)    
+                with self.trace.span("compact", agent_id=self.trace_name,
+                                     turn=self.trace_turn,
+                                     correlation_id=block.id) as s:
+                    s.set("layer", "budget")
+                    s.set("before_chars", len(str(tool_result)))
+                    tool_result = self.compact_mannager.tool_result_budget(tool_result)
+                    s.set("after_chars", len(str(tool_result)))    
                 tool_results.append(tool_result)                 
 
             
@@ -256,10 +305,20 @@ class ClaudeMini():
             })
 
             #压缩消息数量
-            history[:] = self.compact_mannager.snip_compact(history)
+            with self.trace.span("compact", agent_id=self.trace_name,
+                                 turn=self.trace_turn) as s:
+                s.set("layer", "snip")
+                s.set("before", len(history))
+                history[:] = self.compact_mannager.snip_compact(history)
+                s.set("after", len(history))
 
             #模型总结上下文
-            history[:] = self.compact_mannager.llm_compact(history,self.llm)
+            with self.trace.span("compact", agent_id=self.trace_name,
+                                 turn=self.trace_turn) as s:
+                s.set("layer", "llm")
+                s.set("before_chars", sum(len(str(m)) for m in history))
+                history[:] = self.compact_mannager.llm_compact(history,self.llm)
+                s.set("after_chars", sum(len(str(m)) for m in history))
     
     #agent teams
     # 成员的生命周期:idle(真阻塞) → work → idle ... 直到主agent请求下线并完成最终确认
@@ -775,10 +834,15 @@ class ClaudeMini():
         if self.role != ROLE_MAIN:
             return "❌ 只有主agent能起子agent。自己做,或把需求带回父agent。"
 
-        HOOKS.trigger_hooks("BefSubAgent",prompt)
+        bef = HOOKS.trigger_hooks("BefSubAgent",prompt)
+        self.trace.emit("hook_decision",
+                        {"hook": "BefSubAgent", "prompt": prompt, "result": bef},
+                        agent_id=self.trace_name, turn=self.trace_turn)
 
         #子agent的 agent_name 保持默认 "main"(和以前一样)
         subagent = self._build_subagent()
+        #前台子agent 的 agent_id 默认撞 "main",trace 里给它一条独轨
+        subagent.trace_name = "sub-" + uuid.uuid4().hex[:4]
 
         history = [
             {
@@ -789,7 +853,10 @@ class ClaudeMini():
 
         result = subagent.run(history)
 
-        HOOKS.trigger_hooks("AftSubAgent",result)
+        aft = HOOKS.trigger_hooks("AftSubAgent",result)
+        self.trace.emit("hook_decision",
+                        {"hook": "AftSubAgent", "result": aft},
+                        agent_id=self.trace_name, turn=self.trace_turn)
 
         return result
 
@@ -826,7 +893,12 @@ class ClaudeMini():
     #   子agent本体是 slient=False,不会刷模型的正文,只有 banner 会串行;
     #   省掉 hook 是更坏的选择 —— 那等于这个子agent在观测面上根本不存在。
     def _run_background_subagent(self, task_id, prompt):
-        HOOKS.trigger_hooks("BefSubAgent", prompt)
+        #本函数跑在 TaskRunner 的线程里,主agent 的 trace_turn 在这里没有意义——turn 不填。
+        #agent_id 用 task_id:后台子agent 天生有唯一名,不存在前台那种撞轨
+        bef = HOOKS.trigger_hooks("BefSubAgent", prompt)
+        self.trace.emit("hook_decision",
+                        {"hook": "BefSubAgent", "prompt": prompt, "result": bef},
+                        agent_id=task_id)
 
         #agent_name 用 task_id:进程里可能同时有好几个后台子agent,名字是事后对账用的
         #(banner、异常栈、提交时回给模型的那句 "子agent bg_0002 已在后台执行" 指的是同一个)
@@ -841,7 +913,10 @@ class ClaudeMini():
 
         result = subagent.run(history)
 
-        HOOKS.trigger_hooks("AftSubAgent", result)
+        aft = HOOKS.trigger_hooks("AftSubAgent", result)
+        self.trace.emit("hook_decision",
+                        {"hook": "AftSubAgent", "result": aft},
+                        agent_id=task_id)
 
         return result
 
@@ -926,7 +1001,13 @@ class ClaudeMini():
                      if isinstance(block.input, dict) else block.input)
 
         t0 = time.perf_counter()
-        output = self._excute_tool(block)
+        #trace 只留现场:output 超长的部分由 sanitize 截断,全文另有 tool_result/ 落盘
+        with self.trace.span("tool_call", agent_id=self.trace_name,
+                             turn=self.trace_turn, correlation_id=block.id) as s:
+            s.set("name", block.name)
+            s.set("input", block.input)
+            output = self._excute_tool(block)
+            s.set("output", str(output))
         ui.tool_result(output, ms=int((time.perf_counter() - t0) * 1000), who=who)
         return output
 
@@ -976,6 +1057,13 @@ class ClaudeMini():
 
         #prehook进行权限检查，zai
         hook_result = HOOKS.trigger_hooks("PreToolUse", block)
+        #hook 的每种结局(pass/blocked+理由)都是一条判定记录——阶段2权限fuzz的核心证据源
+        self.trace.emit("hook_decision",
+                        {"hook": "PreToolUse", "tool": block.name,
+                         "decision": "pass" if hook_result is None else "blocked",
+                         "reason": hook_result},
+                        agent_id=self.trace_name, turn=self.trace_turn,
+                        correlation_id=block.id)
         if hook_result is not None:
             ui.debug(f"Hook result: {hook_result}")
             return hook_result

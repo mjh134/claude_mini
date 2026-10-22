@@ -2,6 +2,7 @@ import queue
 import threading
 import HOOKS
 import ui
+import trace
 from claude import ClaudeMini
 from dispatcher import JobDispatcher
 from llm import explain_error
@@ -73,6 +74,10 @@ def user_loop(history,claude_mini:ClaudeMini):
 
 if __name__ == "__main__":
 
+    #显式初始化观测面(而不是等第一次建 agent 时懒建):
+    #启动那一刻就把文件建出来,建不起来当场告警,别等对话到一半才发现没留 trace
+    trace.get_trace()
+
     #初始化agent
     claude_mini = ClaudeMini(show_thinking=True, agent_name="main")
 
@@ -117,4 +122,7 @@ if __name__ == "__main__":
 
     #关闭MCP 服务器子进程
     claude_mini.mcp.close()
+
+    #关闭观测面。放在最后——上面 consolidate_if_due 还要调 LLM，那些请求也值得留痕
+    trace.get_trace().close()
     

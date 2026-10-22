@@ -1,6 +1,7 @@
 import threading
 import time
 from bash_exec import execute_bash
+import trace
 import ui
 
 #后台 agent 的并发上限。
@@ -82,6 +83,10 @@ class TaskRunner:
     #否则将来同一个执行体换个工具入口(比如 job 跑一条命令)就得再造一个入口。
     def submit_bash(self, command):
         task_id = self._new_task("bash")
+        #agent_id 用通道名:本类不认识 agent(职责边界契约),runner 前缀本就是为区分主对话/派发器设计的
+        trace.get_trace().emit("task_event",
+                               {"action": "submit", "kind": "bash", "command": command},
+                               agent_id=f"runner-{self.id_prefix}", correlation_id=task_id)
         thread = threading.Thread(target=self._run_bash, args=(task_id, command), daemon=True)
         thread.start()
         self._attach_thread(task_id, thread)
@@ -119,6 +124,10 @@ class TaskRunner:
             #去通知调用方 —— 回调只捏在 _run_agent 手里的话,线程一没,那条通知就永远发不出去
             self.tasks[task_id] = _record("agent", on_done)
             self.agents_running += 1
+        #锁过了才记——名额满返回 None 的路径不该有这条事件
+        trace.get_trace().emit("task_event",
+                               {"action": "submit", "kind": "agent"},
+                               agent_id=f"runner-{self.id_prefix}", correlation_id=task_id)
         thread = threading.Thread(target=self._run_agent, args=(task_id, work), daemon=True)
         thread.start()
         self._attach_thread(task_id, thread)
@@ -167,6 +176,10 @@ class TaskRunner:
             }
             self.ready.append(task_id)
             on_done, task["on_done"] = task["on_done"], None   #回调只准发一次
+        #终态事件放锁外(锁里做 IO 是死锁素材),且只有真收尾才记——幂等保证它只响一次
+        trace.get_trace().emit("task_event",
+                               {"action": "finalize", "status": status, "output": output},
+                               agent_id=f"runner-{self.id_prefix}", correlation_id=task_id)
         if on_done is not None:
             try:
                 on_done(status == "completed", output)
