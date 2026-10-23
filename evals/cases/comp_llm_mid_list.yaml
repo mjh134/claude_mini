@@ -1,0 +1,68 @@
+# comp_llm_mid_list — 压缩因子格 layer=llm pos=middle dep=sequence
+# reference：清单格：v0 只埋一条 ITEM（其余文件是纯填充），判据=该条目在摘要压缩后仍可回取。扩格方向：ITEM 埋 10 条判 full-recall。
+
+id: comp_llm_mid_list
+suite: capability
+factor:
+  layer: llm
+  position: middle
+  dependency: sequence
+setup:
+  files:
+  - path: doc_01.txt
+    chars: 1500
+    literal: 'ITEM_ALPHA=7788
+
+      '
+    at: 0.5
+  - path: doc_02.txt
+    chars: 1500
+  - path: doc_03.txt
+    chars: 1500
+  - path: doc_04.txt
+    chars: 1500
+  - path: doc_05.txt
+    chars: 1500
+  - path: doc_06.txt
+    chars: 1500
+  - path: doc_07.txt
+    chars: 1500
+  - path: doc_08.txt
+    chars: 1500
+  - path: doc_09.txt
+    chars: 1500
+  - path: doc_10.txt
+    chars: 1500
+  blocks:
+    block: 14000
+acts:
+- '并行读取清单里全部 10 个文件，每个回复一行已读：
+
+  {{files_list}}'
+- '把下面的 <原文> 一字不差写入 copy_01.txt 到 copy_12.txt（共 12 个文件）。只能用 write_file 工具逐个写，禁止用 bash/shell 的复制、重定向或脚本批量生成；每个文件的
+  content 参数必须从第一行到最后一行完整包含原文，不许省略、不许加注释：
+
+  <原文>
+
+  {{block}}
+
+  原文结束</原文>'
+expect_pressure:
+  compact_layer: llm
+probe:
+  say: 列出全部 10 个文件里的 ITEM_* 条目，一行一个，不要漏。
+  expect_all:
+  - ITEM_ALPHA=7788
+graders:
+- type: state_check
+  probe:
+    expect_all:
+    - ITEM_ALPHA=7788
+    - '7788'
+- type: tool_calls
+  evidence_read: doc_01.txt
+budget:
+  max_turns: 120
+  max_minutes: 20
+trials: 1
+reference: 清单格：v0 只埋一条 ITEM（其余文件是纯填充），判据=该条目在摘要压缩后仍可回取。扩格方向：ITEM 埋 10 条判 full-recall。

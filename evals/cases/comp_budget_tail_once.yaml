@@ -1,0 +1,36 @@
+# comp_budget_tail_once — 压缩因子格 layer=budget pos=tail dep=once
+# reference：budget 层截掉单结果 2000 字之后的尾部，探针在 0.8 处=被截区域。合格做法：意识到截断标记后用 bash sed/tail 重读尾部。
+
+id: comp_budget_tail_once
+suite: capability
+factor:
+  layer: budget
+  position: tail
+  dependency: once
+setup:
+  files:
+  - path: big.txt
+    chars: 6000
+    needle: true
+    at: 0.8
+acts:
+- '读取 big.txt（清单：
+
+  {{files_list}}），然后用一句话概括主题，不要引用具体行。'
+expect_pressure:
+  compact_layer: budget
+probe:
+  say: 刚才那些文件里，SECRET_TOKEN 的值是什么？只回答值本身，不要解释。
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_exact: '{{needle}}'
+- type: tool_calls
+  evidence_read: big.txt
+  max_same_call: 2
+budget:
+  max_turns: 40
+  max_minutes: 8
+trials: 1
+reference: budget 层截掉单结果 2000 字之后的尾部，探针在 0.8 处=被截区域。合格做法：意识到截断标记后用 bash sed/tail 重读尾部。

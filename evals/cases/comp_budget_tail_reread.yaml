@@ -1,0 +1,35 @@
+# comp_budget_tail_reread — 压缩因子格 layer=budget pos=tail dep=repeat
+# reference：同 tail_once 但判重取代价：同参重读 ≤2 次算合格，3 次以上=在原地打转。
+
+id: comp_budget_tail_reread
+suite: capability
+factor:
+  layer: budget
+  position: tail
+  dependency: repeat
+setup:
+  files:
+  - path: big.txt
+    chars: 6000
+    needle: true
+    at: 0.8
+acts:
+- '读取 big.txt（清单：
+
+  {{files_list}}），先用 read_file 读完整文件（不要用 bash），读完后报告其中 SECRET_TOKEN 的值。'
+expect_pressure:
+  compact_layer: budget
+probe:
+  say: 确认一次：SECRET_TOKEN 的值是多少？只回答值。
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_exact: '{{needle}}'
+- type: tool_calls
+  max_same_call: 2
+budget:
+  max_turns: 40
+  max_minutes: 8
+trials: 1
+reference: 同 tail_once 但判重取代价：同参重读 ≤2 次算合格，3 次以上=在原地打转。

@@ -1,0 +1,101 @@
+# comp_snip_mid_update — 压缩因子格 layer=snip pos=middle dep=update
+# reference：知识更新格：上下文里存着旧值，磁盘已是 feedcafe。合格做法：意识到「以当前内容为准」后重读；拿上下文旧值回答=判 fail（这正是要逼出来的行为）。
+
+id: comp_snip_mid_update
+suite: capability
+factor:
+  layer: snip
+  position: middle
+  dependency: update
+setup:
+  files:
+  - path: doc_01.txt
+    chars: 800
+  - path: doc_02.txt
+    chars: 800
+  - path: doc_03.txt
+    chars: 800
+    needle: true
+    at: 0.5
+  - path: doc_04.txt
+    chars: 800
+  - path: doc_05.txt
+    chars: 800
+  - path: doc_06.txt
+    chars: 800
+  - path: doc_07.txt
+    chars: 800
+  - path: doc_08.txt
+    chars: 800
+  - path: doc_09.txt
+    chars: 800
+  - path: doc_10.txt
+    chars: 800
+  - path: doc_11.txt
+    chars: 800
+  - path: doc_12.txt
+    chars: 800
+  - path: doc_13.txt
+    chars: 800
+  - path: doc_14.txt
+    chars: 800
+  - path: doc_15.txt
+    chars: 800
+  - path: doc_16.txt
+    chars: 800
+  - path: doc_17.txt
+    chars: 800
+  - path: doc_18.txt
+    chars: 800
+  - path: doc_19.txt
+    chars: 800
+  - path: doc_20.txt
+    chars: 800
+  - path: doc_21.txt
+    chars: 800
+  - path: doc_22.txt
+    chars: 800
+  - path: doc_23.txt
+    chars: 800
+  - path: doc_24.txt
+    chars: 800
+  - path: doc_25.txt
+    chars: 800
+  - path: doc_26.txt
+    chars: 800
+  - path: doc_27.txt
+    chars: 800
+  - path: doc_28.txt
+    chars: 800
+  - path: doc_29.txt
+    chars: 800
+  - path: doc_30.txt
+    chars: 800
+acts:
+- '把下面清单里的文件全部读完：严格逐个读，一次只发一个 read_file 调用，必须看到上一份的结果才能发下一个，禁止并行。中间不要输出任何文字、不要提前结束，直到全部读完才回复「全部读完」：
+
+  {{files_list}}'
+expect_pressure:
+  compact_layer: snip
+mid_act:
+  path: doc_03.txt
+  content: 'The quick brown fox jumps over the lazy dog. updated file.
+
+    SECRET_TOKEN=feedcafe
+
+    '
+probe:
+  say: 现在 doc_03.txt 的 SECRET_TOKEN 是多少？以文件当前内容为准，只回答值。
+  expect_exact: feedcafe
+graders:
+- type: state_check
+  probe:
+    expect_exact: feedcafe
+- type: tool_calls
+  evidence_read: doc_03.txt
+  max_same_call: 4
+budget:
+  max_turns: 100
+  max_minutes: 18
+trials: 1
+reference: 知识更新格：上下文里存着旧值，磁盘已是 feedcafe。合格做法：意识到「以当前内容为准」后重读；拿上下文旧值回答=判 fail（这正是要逼出来的行为）。

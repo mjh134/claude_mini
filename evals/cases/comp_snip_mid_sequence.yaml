@@ -1,0 +1,100 @@
+# comp_snip_mid_sequence — 压缩因子格 layer=snip pos=middle dep=sequence
+# reference：两个探针分列被归档中段的两端，必须组合回取。只答出一个=部分回取，判 fail（ capability 该狠）。
+
+id: comp_snip_mid_sequence
+suite: capability
+factor:
+  layer: snip
+  position: middle
+  dependency: sequence
+setup:
+  files:
+  - path: doc_01.txt
+    chars: 800
+  - path: doc_02.txt
+    chars: 800
+  - path: doc_03.txt
+    chars: 800
+  - path: doc_04.txt
+    chars: 800
+  - path: doc_05.txt
+    chars: 800
+  - path: doc_06.txt
+    chars: 800
+  - path: doc_07.txt
+    chars: 800
+  - path: doc_08.txt
+    chars: 800
+    needle: true
+    at: 0.5
+  - path: doc_09.txt
+    chars: 800
+  - path: doc_10.txt
+    chars: 800
+  - path: doc_11.txt
+    chars: 800
+  - path: doc_12.txt
+    chars: 800
+  - path: doc_13.txt
+    chars: 800
+  - path: doc_14.txt
+    chars: 800
+  - path: doc_15.txt
+    chars: 800
+  - path: doc_16.txt
+    chars: 800
+  - path: doc_17.txt
+    chars: 800
+  - path: doc_18.txt
+    chars: 800
+  - path: doc_19.txt
+    chars: 800
+  - path: doc_20.txt
+    chars: 800
+    literal: 'CODE_WORD=ZEBRA-17
+
+      '
+    at: 0.5
+  - path: doc_21.txt
+    chars: 800
+  - path: doc_22.txt
+    chars: 800
+  - path: doc_23.txt
+    chars: 800
+  - path: doc_24.txt
+    chars: 800
+  - path: doc_25.txt
+    chars: 800
+  - path: doc_26.txt
+    chars: 800
+  - path: doc_27.txt
+    chars: 800
+  - path: doc_28.txt
+    chars: 800
+  - path: doc_29.txt
+    chars: 800
+  - path: doc_30.txt
+    chars: 800
+acts:
+- '把下面清单里的文件全部读完：严格逐个读，一次只发一个 read_file 调用，必须看到上一份的结果才能发下一个，禁止并行。中间不要输出任何文字、不要提前结束，直到全部读完才回复「全部读完」：
+
+  {{files_list}}'
+expect_pressure:
+  compact_layer: snip
+probe:
+  say: 第 8 个文件里的 SECRET_TOKEN 和第 20 个文件里的 CODE_WORD 分别是什么？按「token/word」格式回答。
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_all:
+    - '{{needle}}'
+    - ZEBRA-17
+- type: tool_calls
+  evidence_read: doc_
+  max_same_call: 4
+budget:
+  max_turns: 100
+  max_minutes: 18
+trials: 1
+reference: 两个探针分列被归档中段的两端，必须组合回取。只答出一个=部分回取，判 fail（ capability 该狠）。

@@ -1,0 +1,47 @@
+# comp_micro_mid_once — 压缩因子格 layer=micro pos=middle dep=once
+# reference：micro 格。注意：micro 层的 span 记 before/after=len(history)，原地替换内容条数永不变——结构性不可观测，所以压力断言用 budget 作代理信号（文件加到 2500 字逼 budget 触发，needle 在 0.4 处低于 2000 不被截）。探针在 doc_02（最早被缩成指针），测的是 micro 替换后的回取。
+
+id: comp_micro_mid_once
+suite: capability
+factor:
+  layer: micro
+  position: middle
+  dependency: once
+setup:
+  files:
+  - path: doc_01.txt
+    chars: 2500
+  - path: doc_02.txt
+    chars: 2500
+    needle: true
+    at: 0.4
+  - path: doc_03.txt
+    chars: 2500
+  - path: doc_04.txt
+    chars: 2500
+  - path: doc_05.txt
+    chars: 2500
+  - path: doc_06.txt
+    chars: 2500
+acts:
+- '把下面清单里的文件全部读完：严格逐个读，一次只发一个 read_file 调用，必须看到上一份的结果才能发下一个，禁止并行。中间不要输出任何文字、不要提前结束，直到全部读完才回复「全部读完」：
+
+  {{files_list}}'
+expect_pressure:
+  compact_layer: budget
+probe:
+  say: 刚才那些文件里，SECRET_TOKEN 的值是什么？只回答值本身，不要解释。
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_exact: '{{needle}}'
+- type: tool_calls
+  evidence_read: doc_02.txt
+  max_same_call: 3
+budget:
+  max_turns: 40
+  max_minutes: 8
+trials: 1
+reference: micro 格。注意：micro 层的 span 记 before/after=len(history)，原地替换内容条数永不变——结构性不可观测，所以压力断言用 budget 作代理信号（文件加到
+  2500 字逼 budget 触发，needle 在 0.4 处低于 2000 不被截）。探针在 doc_02（最早被缩成指针），测的是 micro 替换后的回取。

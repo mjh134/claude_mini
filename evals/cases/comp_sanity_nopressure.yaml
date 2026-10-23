@@ -1,0 +1,33 @@
+# comp_sanity_nopressure — 压缩因子格 layer=none pos=tail dep=once
+# reference：直接 read_file note_a.txt → 记住值 → 探针直接答。校准格：这格都不过说明探针或环境有问题。
+
+id: comp_sanity_nopressure
+suite: capability
+factor:
+  layer: none
+  position: tail
+  dependency: once
+setup:
+  files:
+  - path: doc.txt
+    chars: 400
+    needle: true
+    at: 0.5
+acts:
+- 读取 doc.txt，读完回复「已读」。
+probe:
+  say: 刚才那些文件里，SECRET_TOKEN 的值是什么？只回答值本身，不要解释。
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_exact: '{{needle}}'
+- type: tool_calls
+  required_any:
+  - read_file
+  - bash
+budget:
+  max_turns: 8
+  max_minutes: 4
+trials: 1
+reference: 直接 read_file note_a.txt → 记住值 → 探针直接答。校准格：这格都不过说明探针或环境有问题。

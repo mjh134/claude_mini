@@ -1,0 +1,33 @@
+# comp_budget_head_control — 压缩因子格 layer=budget pos=head dep=once
+# reference：对照格：探针在前 2000 字幸存区，理论上不重读也该答对。它挂了说明预算截断比预期狠或探针漂移。
+
+id: comp_budget_head_control
+suite: capability
+factor:
+  layer: budget
+  position: head
+  dependency: once
+setup:
+  files:
+  - path: big.txt
+    chars: 6000
+    needle: true
+    at: 0.08
+acts:
+- '读取 big.txt（清单：
+
+  {{files_list}}），然后用一句话概括主题，不要引用具体行。'
+expect_pressure:
+  compact_layer: budget
+probe:
+  say: 刚才那些文件里，SECRET_TOKEN 的值是什么？只回答值本身，不要解释。
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_exact: '{{needle}}'
+budget:
+  max_turns: 40
+  max_minutes: 8
+trials: 1
+reference: 对照格：探针在前 2000 字幸存区，理论上不重读也该答对。它挂了说明预算截断比预期狠或探针漂移。

@@ -1,0 +1,59 @@
+# comp_reactive_mid_once — 压缩因子格 layer=reactive pos=middle dep=once
+# reference：已知高危格：把 history 顶到模型上下文上限，逼 API 报 prompt 过长走 reactive_compact 兜底。可能出现：兜底总结本身超长→报错（error 也是真实数据，如实记录）。
+
+id: comp_reactive_mid_once
+suite: capability
+factor:
+  layer: reactive
+  position: middle
+  dependency: once
+setup:
+  files:
+  - path: doc_01.txt
+    chars: 600
+    needle: true
+    at: 0.5
+  - path: doc_02.txt
+    chars: 600
+  blocks:
+    block: 14000
+acts:
+- '读取清单里的两个文件并各回一行已读：
+
+  {{files_list}}'
+- '把下面的 <原文> 一字不差写入 copy_01.txt 到 copy_14.txt（共 14 个文件）。只能用 write_file 工具逐个写，禁止用 bash/shell 的复制、重定向或脚本批量生成；每个文件的
+  content 参数必须从第一行到最后一行完整包含原文，不许省略、不许加注释：
+
+  <原文>
+
+  {{block}}
+
+  原文结束</原文>'
+- '继续：把同样的 <原文> 写入 copy_15.txt 到 copy_28.txt（同样只能用 write_file 逐个写）：
+
+  <原文>
+
+  {{block}}
+
+  原文结束</原文>'
+- '再来一轮：copy_29.txt 到 copy_42.txt，要求同上：
+
+  <原文>
+
+  {{block}}
+
+  原文结束</原文>'
+probe:
+  say: 刚才那些文件里，SECRET_TOKEN 的值是什么？只回答值本身，不要解释。
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_exact: '{{needle}}'
+- type: tool_calls
+  evidence_read: doc_01.txt
+budget:
+  max_turns: 200
+  max_minutes: 30
+trials: 1
+reference: 已知高危格：把 history 顶到模型上下文上限，逼 API 报 prompt 过长走 reactive_compact 兜底。可能出现：兜底总结本身超长→报错（error 也是真实数据，如实记录）。

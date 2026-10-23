@@ -1,0 +1,59 @@
+# comp_llm_mid_exact — 压缩因子格 layer=llm pos=middle dep=once
+# reference：16 份 14k 拷贝把 history 顶过 200k 触发 llm 层：整段历史被换成模型摘要，探针文件早被压掉。合格做法：从摘要里找线索或直接重读 doc_04。这是最重的一格。
+
+id: comp_llm_mid_exact
+suite: capability
+factor:
+  layer: llm
+  position: middle
+  dependency: once
+setup:
+  files:
+  - path: doc_01.txt
+    chars: 1500
+  - path: doc_02.txt
+    chars: 1500
+  - path: doc_03.txt
+    chars: 1500
+  - path: doc_04.txt
+    chars: 1500
+    needle: true
+    at: 0.5
+  - path: doc_05.txt
+    chars: 1500
+  - path: doc_06.txt
+    chars: 1500
+  - path: doc_07.txt
+    chars: 1500
+  - path: doc_08.txt
+    chars: 1500
+  blocks:
+    block: 14000
+acts:
+- '并行读取清单里全部 8 个文件（一次消息发多个 read_file），每个回复一行已读：
+
+  {{files_list}}'
+- '把下面的 <原文> 一字不差写入 copy_01.txt 到 copy_16.txt（共 16 个文件）。只能用 write_file 工具逐个写，禁止用 bash/shell 的复制、重定向或脚本批量生成；每个文件的
+  content 参数必须从第一行到最后一行完整包含原文，不许省略、不许加注释：
+
+  <原文>
+
+  {{block}}
+
+  原文结束</原文>'
+expect_pressure:
+  compact_layer: llm
+probe:
+  say: 刚才那些文件里，SECRET_TOKEN 的值是什么？只回答值本身，不要解释。
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_exact: '{{needle}}'
+- type: tool_calls
+  evidence_read: doc_04.txt
+budget:
+  max_turns: 120
+  max_minutes: 20
+trials: 1
+reference: 16 份 14k 拷贝把 history 顶过 200k 触发 llm 层：整段历史被换成模型摘要，探针文件早被压掉。合格做法：从摘要里找线索或直接重读 doc_04。这是最重的一格。

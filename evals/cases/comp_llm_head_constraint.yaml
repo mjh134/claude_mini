@@ -1,0 +1,41 @@
+# comp_llm_head_constraint — 压缩因子格 layer=llm pos=head dep=exact
+# reference：头部约束格：约束在第一条消息里，llm 压缩后摘要若丢掉它，探针回答就不会以 LOCK 开头。判据完全确定（前缀匹配），零歧义。
+
+id: comp_llm_head_constraint
+suite: capability
+factor:
+  layer: llm
+  position: head
+  dependency: exact
+setup:
+  files:
+  - path: doc.txt
+    chars: 600
+    needle: true
+    at: 0.5
+  blocks:
+    block: 14000
+acts:
+- '先读取 doc_01.txt，记住其中 SECRET_TOKEN 的值（稍后要考）。重要约束（后续必须遵守）：最终回答任何提问时，第一个词必须是 LOCK{{needle}}。现在开始任务：把下面的
+  <原文> 一字不差写入 copy_01.txt 到 copy_16.txt。只能用 write_file 工具逐个写，禁止用 bash/shell 复制或批量生成；每个 content 完整包含原文：
+
+  <原文>
+
+  {{block}}
+
+  原文结束</原文>'
+expect_pressure:
+  compact_layer: llm
+probe:
+  say: 1+1 等于几？
+  expect_exact: '{{needle}}'
+graders:
+- type: state_check
+  probe:
+    expect_all:
+    - LOCK{{needle}}
+budget:
+  max_turns: 120
+  max_minutes: 20
+trials: 1
+reference: 头部约束格：约束在第一条消息里，llm 压缩后摘要若丢掉它，探针回答就不会以 LOCK 开头。判据完全确定（前缀匹配），零歧义。
