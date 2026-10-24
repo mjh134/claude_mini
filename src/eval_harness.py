@@ -2,9 +2,10 @@
 # -*- coding: utf-8 -*-
 """行为评测编排器（父进程）：读用例 → 每格派子进程 → 收 result → 出报告。
 
-    python eval_harness.py                  # 全部用例各 1 trial
+    python eval_harness.py                  # 全部用例各 1 trial（递归扫 evals/cases/ 子目录）
+    python eval_harness.py --group schema   # 只跑某个主题目录（compact / schema …）
     python eval_harness.py --only comp_sanity_nopressure --trials 1
-    python eval_harness.py --list
+    python eval_harness.py --list           # 按主题分组列出所有格子
 
 父进程零业务 import：不碰 claude/llm，判定在子进程里完成。
 """
@@ -37,15 +38,18 @@ BADGE = {"pass": "✅ PASS", "fail": "❌ FAIL", "not_triggered": "⚪ NOT-TRIGG
          "error": "💥 ERROR"}
 
 
-def load_cases(only):
-    paths = sorted(CASES_DIR.glob("*.yaml"))
+def load_cases(only, group=""):
     cases = []
-    for p in paths:
+    for p in sorted(CASES_DIR.rglob("*.yaml")):   # 递归：分主题子目录后不递归会静默漏格
         case = yaml.safe_load(p.read_text(encoding="utf-8"))
         case["id"] = case.get("id", p.stem)
         case["_path"] = str(p)
-        if not only or case["id"] in only:
-            cases.append(case)
+        case["_group"] = p.parent.name if p.parent != CASES_DIR else "."
+        if only and case["id"] not in only:
+            continue
+        if group and case["_group"] != group:
+            continue
+        cases.append(case)
     return cases
 
 
@@ -135,20 +139,26 @@ def write_report(results):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--only", default="", help="只跑这些 id，逗号分隔")
+    ap.add_argument("--group", default="", help="只跑这个主题子目录的用例（如 compact / schema）")
     ap.add_argument("--trials", type=int, default=0, help="覆盖每格 trial 次数")
     ap.add_argument("--list", action="store_true")
     args = ap.parse_args()
     only = {s.strip() for s in args.only.split(",") if s.strip()}
 
-    cases = load_cases(only)
+    cases = load_cases(only, args.group)
     if args.list:
+        by_group = {}
         for c in cases:
-            f = c.get("factor") or {}
-            print(f"{c['id']:<28} {c.get('suite','?'):<12} "
-                  f"layer={f.get('layer','?'):<9} pos={f.get('position','?'):<7} dep={f.get('dependency','?')}")
+            by_group.setdefault(c["_group"], []).append(c)
+        for g in sorted(by_group):
+            print(f"\n[{g}]  {len(by_group[g])} 格")
+            for c in by_group[g]:
+                f = c.get("factor") or {}
+                print(f"  {c['id']:<28} {c.get('suite','?'):<12} "
+                      f"layer={f.get('layer','?'):<9} pos={f.get('position','?'):<7} dep={f.get('dependency','?')}")
         return 0
     if not cases:
-        print(f"evals/cases/ 下没有匹配的用例（only={only or '全部'}）", file=sys.stderr)
+        print(f"evals/cases/ 下（递归）没有匹配的用例（only={only or '全部'} group={args.group or '全部'}）", file=sys.stderr)
         return 2
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
