@@ -116,7 +116,7 @@ def build_agent():
     HOOKS.register_hook("PreToolUse", eval_permission_hook)
     HOOKS.register_hook("BefSubAgent", HOOKS.before_agent_hook)
     HOOKS.register_hook("AftSubAgent", HOOKS.after_agent_hook)
-    return ClaudeMini(show_thinking=False, slient=False, agent_name="main",
+    return ClaudeMini(show_thinking=False, silent=False, agent_name="main",
                       task_store=store, scheduler=scheduler, mcp=mcp)
 
 

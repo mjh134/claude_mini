@@ -241,11 +241,11 @@ def build_agent():
       思考全文)。排查"它为什么卡在这道题上"的时候把它打开,平时关着 —— 否则屏幕会被
       思考淹掉,反而看不见工具调用那条主线。
 
-    slient=False:让模型正文打出来。跑分一跑几小时,屏幕上没有正文就只剩工具行,
+    silent=False:让模型正文打出来。跑分一跑几小时,屏幕上没有正文就只剩工具行,
     事后根本看不出它是在解题还是在绕圈。
     """
     store, scheduler, mcp = _shared()
-    return ClaudeMini(show_thinking=True, slient=False, agent_name="main",
+    return ClaudeMini(show_thinking=True, silent=False, agent_name="main",
                       task_store=store, scheduler=scheduler, mcp=mcp)
 
 

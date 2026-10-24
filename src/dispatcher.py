@@ -102,7 +102,7 @@ class JobDispatcher:
     #执行体:在后台线程里跑一条定时任务(由 TaskRunner 调用,收 task_id)
     def _run_job(self, task_id, job):
         agent = ClaudeMini(
-            slient=False,               #任务自己那些话不往终端刷(用户可能正在打字)
+            silent=False,               #任务自己那些话不往终端刷(用户可能正在打字)
             role=ROLE_MAIN,             #任务要能写记忆、建任务、用全部工具
             agent_name=task_id,         #身份用派发 id(bg_job_0001):banner、日志、通知都对得上号
             task_store=self.claude_mini.task_store,

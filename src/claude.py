@@ -45,7 +45,7 @@ def _fmt_elapsed(seconds):
 
 class ClaudeMini():
 
-    def __init__(self, show_thinking=False, slient=True, role=ROLE_MAIN,
+    def __init__(self, show_thinking=False, silent=False, role=ROLE_MAIN,
                 task_store=None, scheduler=None, message_bus=None,
                 agent_name="main", agent_id=None, team_runtime=None,
                 mcp=None, task_runner=None, drains_results=None, deny_tools=None):
@@ -64,7 +64,7 @@ class ClaudeMini():
         self.memory_manager = MemoryManager()
 
         self.show_thinking = show_thinking   #是否展示思考
-        self.slient = slient  if slient is not None else True     #是否展示子agent消息
+        self.silent = silent if silent is not None else False     #是否静默(True=不显示模型输出,默认不静默)
 
         # --- 共享服务 ---
         self.task_runner = task_runner if task_runner is not None else TaskRunner()
@@ -254,7 +254,7 @@ class ClaudeMini():
                     else:
                         continue
                 elif block.type == "text" :
-                    if not self.slient:
+                    if not self.silent:
                         ui.assistant(block.text)
                     final_text += block.text
 
@@ -813,7 +813,7 @@ class ClaudeMini():
         #跑完就落进没人读的邮箱(主agent提交后台任务时也共享,理由一样)。
         #邮箱共享了,领取者就唯一 —— 由 drains_results 挡住,子agent 不领(见 __init__)。
         #scheduler 同样必须共享同一实例(锁与扫描线程不可复制)
-        return ClaudeMini(slient=False, role=ROLE_SUBAGENT,
+        return ClaudeMini(silent=False, role=ROLE_SUBAGENT,
                           task_store=self.task_store,
                           scheduler=self.scheduler,
                           task_runner=self.task_runner,
@@ -891,7 +891,7 @@ class ClaudeMini():
     #   这条线程上所有 ASK 类操作(写 memory/、覆盖已有文件…)一律被拒。这是决策:
     #   后台任务没人守着屏幕,不该挂在那里等一个可能已经走开的用户。
     #② 打印会和用户输入交错(hook 的 banner 是从这条线程打出去的)。
-    #   子agent本体是 slient=False,不会刷模型的正文,只有 banner 会串行;
+    #   子agent本体是 silent=False,不会刷模型的正文,只有 banner 会串行;
     #   省掉 hook 是更坏的选择 —— 那等于这个子agent在观测面上根本不存在。
     def _run_background_subagent(self, task_id, prompt):
         #本函数跑在 TaskRunner 的线程里,主agent 的 trace_turn 在这里没有意义——turn 不填。

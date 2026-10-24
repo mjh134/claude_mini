@@ -79,7 +79,7 @@ if __name__ == "__main__":
     trace.get_trace()
 
     #初始化agent
-    claude_mini = ClaudeMini(show_thinking=True, agent_name="main")
+    claude_mini = ClaudeMini(show_thinking=True, silent=False, agent_name="main")
 
     #加载狗子
     HOOKS.register_hook("PreToolUse", HOOKS.permission_hook)

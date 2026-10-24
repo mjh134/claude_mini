@@ -589,13 +589,12 @@ def thinking_live():
     """开一条流式思考的活行。不能刷的时候返回哑句柄(方法全是空转)。
 
     ★ 为什么天然只可能有一个:全项目只有 main.py:106 传了 show_thinking=True ——
-    定时任务(dispatcher.py:104)传的是 slient=False + role=ROLE_MAIN,**没传**
+    定时任务(dispatcher.py:104)传的是 silent=False + role=ROLE_MAIN,**没传**
     show_thinking,所以是 False。而活行只在 show_thinking 为真时才建。
     于是进程里最多一个持有者。★ 但也**仅此而已** —— "最多一个"不代表"只有创建它的
     那条线程碰它":子agent在自己线程里打印时会经 _print_yielding 找到它、让它让位。
     所以互斥还是得有,锁在 _LiveLine 里。
-    顺带说清:slient **不是**合适的判据 —— 它管的是"子agent消息展不展示",和这个无关
-    (而且它的名字和注释都是错的,那是另一件事)。
+    顺带说清:silent **不是**合适的判据 —— 它管的是"模型正文显不显示",和这个无关。
 
     判据用 PT_ACTIVE 而不是 sys.stdout.isatty():PT_ACTIVE 恰好就是
     "读线程已接管终端、patch_stdout 生效中",这才是活行能工作的前提(定义在下面反问那节)
