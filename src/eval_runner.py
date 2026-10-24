@@ -132,6 +132,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--case", required=True)
     ap.add_argument("--trial-dir", required=True)
+    ap.add_argument("--trial-no", type=int, default=1)   #trial 序号只有父进程知道，显式传进来（别从目录名反推，那是跟命名约定耦合）
     args = ap.parse_args()
 
     trial_dir = Path(args.trial_dir)
@@ -144,7 +145,7 @@ def main():
     trace_mod.get_trace()                      # 先建实例，保证 trace_path 存在
     started = time.time()
     trial = {"case": case["id"], "suite": case.get("suite", "capability"),
-             "trial_no": int(case.get("trial", 1)), "verdict": "error",
+             "trial_no": args.trial_no, "verdict": "error",
              "assertions": [], "answer": "", "needle": None,
              "ws_path": str(ws), "trace_path": str(trace_mod.get_trace().path),
              "error": None}

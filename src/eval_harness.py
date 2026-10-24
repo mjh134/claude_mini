@@ -59,7 +59,8 @@ def run_trial(case, trial_no):
 
     minutes = float((case.get("budget") or {}).get("max_minutes", DEFAULT_MINUTES))
     cmd = [sys.executable, str(SRC / "eval_runner.py"),
-           "--case", case["_path"], "--trial-dir", str(trial_dir)]
+           "--case", case["_path"], "--trial-dir", str(trial_dir),
+           "--trial-no", str(trial_no)]
     started = time.time()
     try:
         proc = subprocess.run(cmd, cwd=str(ws), env=ENV, capture_output=True,
