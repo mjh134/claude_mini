@@ -1,0 +1,39 @@
+# bgtask_bash_done — 后台任务正常路径:提交→落盘→执行→通知送达 · suite=capability
+# reference: 幕1 起后台 bash(2 秒后往 bg_result.txt 写标记);幕2 干别的活给完成留时间;
+#   探针幕的 run() 开头 collect 会把 <task_notification> 送进 history,模型应能报出产出。
+#   判 outcome:产出文件在 + 回答含标记;盘上条目应收尾即删(bg_tasks.json 不再含标记)。
+
+id: bgtask_bash_done
+suite: capability
+factor:
+  layer: bgtask
+  position: tail
+  dependency: once
+bg_log: ".task/bg_tasks.json"
+setup:
+  files:
+  - path: seed.txt
+    chars: 300
+acts:
+- "用 bash 工具、is_background 参数设为 true，后台执行这条命令：python -c \"import time; time.sleep(2); open('bg_result.txt', 'w', encoding='utf-8').write('BG_DONE_OK9Q')\" 。提交后不要等待，直接告诉我任务号。"
+- "读一下 seed.txt，告诉我它大概有多少行。（顺便给后台任务留出完成时间）"
+probe:
+  say: "那条后台任务现在跑完了吗？如果它往 bg_result.txt 写了内容，把内容原样告诉我。"
+  expect_exact: "BG_DONE_OK9Q"
+graders:
+- type: state_check
+  probe:
+    expect_exact: "BG_DONE_OK9Q"
+  files:
+  - path: bg_result.txt
+    content_exact: "BG_DONE_OK9Q"
+  - path: ".task/bg_tasks.json"
+    content_absent: "BG_DONE_OK9Q"
+- type: tool_calls
+  required_any:
+  - bash
+budget:
+  max_turns: 16
+  max_minutes: 5
+trials: 2
+reference: "幕1 提交后台 bash 并落盘登记；任务 2 秒后完成、收尾删盘；探针幕 collect 到通知并报出 BG_DONE_OK9Q。盘上无残留条目。"

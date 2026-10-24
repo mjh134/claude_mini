@@ -6,6 +6,7 @@ import trace
 from claude import ClaudeMini
 from dispatcher import JobDispatcher
 from llm import explain_error
+from task_runner import TaskRunner
 import skill
 
 
@@ -79,7 +80,10 @@ if __name__ == "__main__":
     trace.get_trace()
 
     #初始化agent
-    claude_mini = ClaudeMini(show_thinking=True, silent=False, agent_name="main")
+    #主对话 runner 带落盘:唯一需要“重启后交代中断任务”的通道(它那份邮箱重启后由
+    #新进程的主对话接着读)。派发器/子agent/评测的 runner 都不传 —— 见 TaskRunner 的 opt-in 注释
+    claude_mini = ClaudeMini(show_thinking=True, silent=False, agent_name="main",
+                             task_runner=TaskRunner(store_path=".task/bg_tasks.json"))
 
     #加载狗子
     HOOKS.register_hook("PreToolUse", HOOKS.permission_hook)

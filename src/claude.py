@@ -875,8 +875,9 @@ class ClaudeMini():
 
         #work 是个闭包,在 TaskRunner 的线程里执行 —— 捕获的 self 是主agent,
         #只用到它的共享服务(task_store/scheduler/task_runner/mcp),不碰它的历史
+        #desc 把 prompt 交给 runner:进程若在任务跑完前被杀,中断交代里能看到它当时在干什么
         task_id = self.task_runner.submit_agent(
-            lambda tid: self._run_background_subagent(tid, prompt))
+            lambda tid: self._run_background_subagent(tid, prompt), desc=prompt)
 
         if task_id is None:
             #满了必须**说出来**。静默丢弃的话模型以为已经跑上了,永远不会去补那个任务
@@ -1153,7 +1154,9 @@ class ClaudeMini():
             return None
 
         KIND_LABEL = {"bash": "bash命令", "agent": "子agent"}
-        STATUS_LABEL = {"completed": "已完成", "failed": "已失败"}
+        #interrupted 来自 TaskRunner._load:上次进程被强杀时没收尾的任务,重启后转成的通知
+        STATUS_LABEL = {"completed": "已完成", "failed": "已失败",
+                        "interrupted": "在上次进程中断时没跑完"}
 
         notifications = []
 

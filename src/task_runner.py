@@ -1,5 +1,8 @@
+import json
 import threading
 import time
+from datetime import datetime
+from pathlib import Path
 from bash_exec import execute_bash
 import trace
 import ui
@@ -15,6 +18,21 @@ _THREAD_DIED_OUTPUT = (
     "这条后台任务的线程在写出结果之前就终止了,没有留下输出。"
     "它没做完的活没有人接手(线程级异常不会走到这里来),需要的话请重新提交一次。"
 )
+
+
+#上次进程被强杀时没来得及收尾的任务,重启后转成邮箱通知的正文(_load 用它)。
+#口气对齐 _THREAD_DIED_OUTPUT:诊断结论 + 指出该重新提交 —— 模型看到要知道任务已经
+#死了、不会再来通知,而不是继续等。只交代不重放:和 cron 僵尸回收同一个哲学,
+#副作用任务(发消息/改文件)重放是危险的,宁可漏一次也不能重放
+#task_id 不用传进正文:通知外壳(build_task_notifications)已经带了
+def _interrupted_output(kind, desc, submitted_at):
+    label = "命令" if kind == "bash" else "任务描述"
+    return (
+        "这条后台任务在上次进程运行期间被中断(进程没等到它收尾就没了),它没有跑完。\n"
+        f"提交时刻:{submitted_at}\n"
+        f"当时的{label}:{desc}\n"
+        "它没做完的活没有人接手。需要的话先确认现在还该不该做,再重新提交一次。"
+    )
 
 
 #任务记录的**唯一**形状定义。两处共用是因为 submit_agent 必须把"查名额"和"登记"
@@ -45,14 +63,26 @@ class TaskRunner:
     #id_prefix:task_id 的前缀。进程里可能有不止一个 runner(主对话一个、
     #定时任务派发器一个),各自从 1 开始计数,不加区分就会出现两个 bg_0001 ——
     #通知、banner、日志全对不上号。默认 "bg",派发器用 "bg_job"
-    def __init__(self, id_prefix="bg"):
+    #store_path(可选):后台任务日志的落盘文件。**显式 opt-in**:None(默认)完全不碰盘 ——
+    #进程里 runner 有好几个(主对话/派发器/定时任务内部),不是每个都值得落:
+    #派发器那份邮箱重启后没人读,落了也白落(cron 任务中断由 Scheduler._load 的
+    #僵尸回收交代);bench/eval 更不能把评测垃圾写进日常库。谁需要恢复能力谁显式传。
+    #只存"未收尾"的任务:提交时登记、收尾时删条目 —— 盘上存在 = 被中断,_load 零分支。
+    #已完成未领取的结果**不落盘**:工作已经做完,丢的只是通知,不算中断
+    def __init__(self, id_prefix="bg", store_path=None):
         self.id_prefix = id_prefix
+        self.store_path = Path(store_path) if store_path else None
         self.tasks = {}         # task_id -> _record() 那份形状(含 thread / on_done)
         self.ready = []         # 已完成、等待领取的 task_id(邮箱)
         self.results = {}       # task_id -> {"kind", "status", "output"}
         self.counter = 0
         self.agents_running = 0 #当前在跑的后台 agent 数,对着 MAX_BACKGROUND_AGENTS 卡
         self.lock = threading.Lock()
+        #落盘专用锁,和内存锁分开:盘上的 read-modify-write 要整段串行(两个线程同时
+        #收尾两条任务,各自读到旧文件再写回就会互相覆盖),但不该让内存锁陪着文件 IO。
+        #锁序永远是 lock -> _io_lock 单向,没有反向获取,无死锁环
+        self._io_lock = threading.Lock()
+        self._load()            #上次进程留下的未收尾任务,转成邮箱通知(见 _load)
 
     #登记一条新任务,占一个 task_id
     #kind 只用于区分执行体(日志和排查要靠它),不参与任何分支判断
@@ -83,6 +113,9 @@ class TaskRunner:
     #否则将来同一个执行体换个工具入口(比如 job 跑一条命令)就得再造一个入口。
     def submit_bash(self, command):
         task_id = self._new_task("bash")
+        #落盘必须在线程 start 之前:线程跑得再快,删盘(收尾)也只会发生在加盘之后 ——
+        #反过来的话,一条瞬完成的任务会在盘上留下幽灵条目,下次启动被误报成中断
+        self._persist_add(task_id, "bash", command)
         #agent_id 用通道名:本类不认识 agent(职责边界契约),runner 前缀本就是为区分主对话/派发器设计的
         trace.get_trace().emit("task_event",
                                {"action": "submit", "kind": "bash", "command": command},
@@ -112,7 +145,10 @@ class TaskRunner:
     #它让调用方能拿回执行结果,而本类仍然**不认识调用方是什么** ——
     #定时任务靠它把结果汇报给 Scheduler,本类全程不知道"job"这个词。
     #回调里抛异常不会影响收尾(结果已经在邮箱里了),只打一行日志
-    def submit_agent(self, work, on_done=None):
+    #desc(可选):这个 agent 任务是"干什么"的一段人类可读描述(主对话传子agent 的 prompt)。
+    #work 是闭包,本类看不见里面的内容 —— 没有这段描述,中断交代只能说"一个 agent 任务没了",
+    #模型和用户没法判断丢了什么。它只进日志和中断交代,不参与任何执行逻辑
+    def submit_agent(self, work, on_done=None, desc=""):
         #查名额和登记必须在**同一把锁里** —— 分成两步,两个调用方就会同时看到"还有名额",
         #一起把 agents_running 顶过上限
         with self.lock:
@@ -128,6 +164,8 @@ class TaskRunner:
         trace.get_trace().emit("task_event",
                                {"action": "submit", "kind": "agent"},
                                agent_id=f"runner-{self.id_prefix}", correlation_id=task_id)
+        #和 submit_bash 同理:start 之前落盘,防"先删后加"的幽灵条目
+        self._persist_add(task_id, "agent", desc)
         thread = threading.Thread(target=self._run_agent, args=(task_id, work), daemon=True)
         thread.start()
         self._attach_thread(task_id, thread)
@@ -180,6 +218,9 @@ class TaskRunner:
         trace.get_trace().emit("task_event",
                                {"action": "finalize", "status": status, "output": output},
                                agent_id=f"runner-{self.id_prefix}", correlation_id=task_id)
+        #盘上条目同步删掉(False 路径不动盘:先收尾的那个已经删过了)。删了它,
+        #"盘上存在 = 未收尾"这个不变量才成立,下次启动才不会把正常跑完的任务误报成中断
+        self._persist_remove(task_id)
         if on_done is not None:
             try:
                 on_done(status == "completed", output)
@@ -213,6 +254,94 @@ class TaskRunner:
                 ui.warn(f"[task_runner] {task_id} 的后台线程在写出结果之前就终止了,"
                       f"已按失败补一条通知")
         return dead
+
+    #--- 后台任务日志(落盘/加载) ---
+    #文件形状:{"tasks": {task_id: {"kind", "desc", "submitted_at"}}},只存未收尾的任务。
+    #submitted_at 用 wall clock:它要跨进程读给人看,monotonic 一重启就归零没有意义;
+    #内存里那份 started_at(monotonic) 不受影响 —— 两套时钟各管各的(算时长/跨进程)
+
+    #登记一条到盘上。写失败只警告不抛:持久化是恢复面,不能因为它挂掉任务提交主流程
+    def _persist_add(self, task_id, kind, desc):
+        if self.store_path is None:
+            return
+        entry = {"kind": kind, "desc": desc,
+                 "submitted_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+        try:
+            with self._io_lock:
+                data = {"tasks": {}}
+                if self.store_path.exists():
+                    data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                data.setdefault("tasks", {})[task_id] = entry
+                self.store_path.parent.mkdir(parents=True, exist_ok=True)
+                self.store_path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, ValueError) as e:
+            ui.warn(f"[task_runner] 后台任务日志写不进去(中断后将无法交代 {task_id}):"
+                    f"{type(e).__name__}: {e}")
+
+    #从盘上删一条(_finalize 的真收尾路径调)
+    def _persist_remove(self, task_id):
+        if self.store_path is None:
+            return
+        try:
+            with self._io_lock:
+                if not self.store_path.exists():
+                    return
+                data = json.loads(self.store_path.read_text(encoding="utf-8"))
+                if data.get("tasks", {}).pop(task_id, None) is None:
+                    return
+                self.store_path.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, ValueError) as e:
+            ui.warn(f"[task_runner] 后台任务日志删不掉 {task_id}"
+                    f"(下次启动可能误报中断):{type(e).__name__}: {e}")
+
+    #把盘清成空库:启动加载把遗留条目全转成通知之后调 —— 不清的话,
+    #下次启动会把同一批中断再交代一遍
+    def _persist_reset(self):
+        try:
+            with self._io_lock:
+                self.store_path.parent.mkdir(parents=True, exist_ok=True)
+                self.store_path.write_text(
+                    json.dumps({"tasks": {}}, ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, ValueError) as e:
+            ui.warn(f"[task_runner] 后台任务日志清不掉(下次启动会重复交代):"
+                    f"{type(e).__name__}: {e}")
+
+    #启动加载:上次进程留下的未收尾任务,每条转成一个"中断交代"塞进邮箱。
+    #主 agent 下一轮顺着现成的 has_completed() -> collect() -> <task_notification>
+    #看到它,main.py 的唤醒条件一个字不用改(这正是选择"补成结果"而不是新探针的理由,
+    #与 reap_dead 同一套思路)
+    def _load(self):
+        if self.store_path is None or not self.store_path.exists():
+            return
+        try:
+            raw = json.loads(self.store_path.read_text(encoding="utf-8"))
+            entries = dict(raw.get("tasks", {}))
+        except (OSError, ValueError) as e:
+            ui.warn(f"[task_runner] 后台任务日志 {self.store_path.name} 读不出来,"
+                    f"中断交代放弃:{type(e).__name__}: {e}")
+            try:    #坏文件改名留证,免得每次启动都撞同一堵墙;失败就留着,下次再报
+                self.store_path.rename(
+                    self.store_path.with_name(self.store_path.name + ".bad"))
+            except OSError:
+                pass
+            return
+        for task_id, entry in entries.items():
+            kind = entry.get("kind", "?")
+            output = _interrupted_output(kind, entry.get("desc", ""),
+                                         entry.get("submitted_at", "未知时刻"))
+            rec = _record(kind)
+            #status 必须不是 running:reap_dead / running() 只认 running,
+            #interrupted 让这条"记录"不会被当成在跑的任务;而 tasks 里必须有它,
+            #collect() 领取时那句 tasks.pop 才不会 KeyError
+            rec["status"] = "interrupted"
+            self.tasks[task_id] = rec
+            self.results[task_id] = {"kind": kind, "status": "interrupted", "output": output}
+            self.ready.append(task_id)
+            ui.warn(f"[task_runner] 发现上次中断的后台任务 {task_id}({kind}),已转为通知")
+        if entries:
+            self._persist_reset()
 
     #领取已完成任务的结果(主线程在 run() 开头调)
     #返回 {task_id: {"kind", "status", "output"}} —— 带上 kind 和 status 是为了让通知能说清

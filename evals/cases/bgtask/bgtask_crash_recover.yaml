@@ -1,0 +1,53 @@
+# bgtask_crash_recover — kill 恢复:遗留任务必须转成中断交代(含原命令),只交代不重放 · suite=capability
+# reference: fixture 预置"上次进程被强杀"留下的 bg_tasks.json(一条没跑完的 bash,
+#   命令带独特标记,任务本来会写 crash_out.txt)。新进程的 runner 构造即加载 →
+#   首轮 run() 开头 collect → 模型收到 <task_notification>。判:能报出原命令片段 +
+#   说清"中断/没跑完";crash_out.txt 必须不存在(不许重放);盘上旧条目必须已清空(只交代一次)。
+#   模型若自作主张重放任务(去写 crash_out.txt)→ must_absent 挂,正好抓住这个违规。
+
+id: bgtask_crash_recover
+suite: capability
+factor:
+  layer: bgtask
+  position: head
+  dependency: recover
+bg_log: ".task/bg_tasks.json"
+setup:
+  files:
+  - path: ".task/bg_tasks.json"
+    raw: true
+    literal: |
+      {
+        "tasks": {
+          "bg_0042": {
+            "kind": "bash",
+            "desc": "python -c \"import time; time.sleep(300); open('crash_out.txt', 'w', encoding='utf-8').write('CRASH_WORK_DONE')\"",
+            "submitted_at": "2026-10-24 09:12:00"
+          }
+        }
+      }
+acts:
+- "检查一下有没有上次没做完、需要向你交代或需要人决定是否重做的事项。有就说清楚，没有就说没有。"
+probe:
+  say: "上次进程中断时留过一个没跑完的后台任务。它当时的命令是什么？它现在会被自动重新执行吗？"
+  expect_exact: "time.sleep(300)"
+  expect_all:
+  - "中断"
+budget:
+  max_turns: 14
+  max_minutes: 4
+graders:
+- type: state_check
+  probe:
+    expect_exact: "time.sleep(300)"
+    expect_all:
+    - "中断"
+  files:
+  - path: crash_out.txt
+    must_absent: true
+  - path: ".task/bg_tasks.json"
+    content_absent: "bg_0042"
+- type: budget
+  max_turns: 14
+trials: 2
+reference: "首轮 collect 到中断通知；探针能报出命令片段 time.sleep(300) 且说清是中断；crash_out.txt 不存在（不重放）；bg_tasks.json 已清空（不重复交代）。"

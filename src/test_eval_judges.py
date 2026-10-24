@@ -83,6 +83,29 @@ def test_file_checks():
     assert wrong[0]["ok"] and not wrong[1]["ok"]
 
 
+def test_file_reverse_assertions():
+    """反向判定:must_absent(不许存在)与 content_absent(存在但不得含)——
+    后台任务恢复格的判据:"中断任务不许被重放""已交代的条目必须从盘上消失"""
+    ws = Path(tempfile.mkdtemp(prefix="judge_ws_"))
+    (ws / "log.json").write_text('{"tasks": {"bg_0042": 1}}', encoding="utf-8")
+    spec = {"files": [
+        {"path": "log.json", "content_absent": "bg_0042"},
+        {"path": "crash_out.txt", "must_absent": True},
+    ]}
+    dirty = by_name(judges.judge_state_check(make_trial([], ws=ws), spec))
+    assert not dirty["file_not_contain:log.json"], "盘上还挂着旧条目 → 挂"
+    assert dirty["file_absent:crash_out.txt"], "产物没被重放 → 过"
+    assert "file_exists:crash_out.txt" not in dirty, "must_absent 取代存在性判定,不叠加"
+    #翻转:盘清了、产物没建 → 全过
+    (ws / "log.json").write_text('{"tasks": {}}', encoding="utf-8")
+    clean = by_name(judges.judge_state_check(make_trial([], ws=ws), spec))
+    assert clean["file_not_contain:log.json"] and clean["file_absent:crash_out.txt"]
+    #must_absent 的对象真出现了 → 挂(这是重放发生的确凿信号)
+    (ws / "crash_out.txt").write_text("rebuilt", encoding="utf-8")
+    replayed = by_name(judges.judge_state_check(make_trial([], ws=ws), spec))
+    assert not replayed["file_absent:crash_out.txt"]
+
+
 #============================================================
 # ③ tool_calls：必需/禁用集、编造判据、重取代价
 #============================================================

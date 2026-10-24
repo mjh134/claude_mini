@@ -29,6 +29,23 @@ evals/cases/
 
 复测：`python src/eval_harness.py --group schema --trials 2`。设计见 `doc/decisions/0004`。
 
+## bgtask/：后台任务管理（ROADMAP 项 7）
+
+被测能力 = 后台任务的提交落盘 / 完成通知 / 中断恢复 / 坏日志降级。runner 按用例顶层 `bg_log` 声明注入日志文件（只有这组格带落盘，其余格零污染）；fixture 可用 `raw: true` 全文预置遗留日志，模拟“上次进程被强杀”的世界。
+
+| 格 | 因子 | 判据 |
+|---|---|---|
+| bgtask_bash_done | bash×完成 | 探针报出产出标记；产物文件在；**盘上条目收尾即删**（content_absent） |
+| bgtask_disk_log | bash×落盘 | 盘上硬证据：未收尾任务的日志含原命令（提交即落盘）；模型能报出命令原文 |
+| bgtask_crash_recover | bash×恢复 | 预置遗留日志 → 首轮通知 → 探针报出原命令片段+说清中断；**产物必须不存在**（must_absent，抓“自作主张重放”）；盘已清空（只交代一次） |
+| bgtask_corrupt_log | bash×坏日志 | 坏 JSON 不炸启动；.bad 留证；正常工作照常完成 |
+
+复测：`python src/eval_harness.py --group bgtask --trials 1`
+
+为此组新增的基建：`state_check.files` 支持 `content_absent`（存在但不得含）/ `must_absent`（必须不存在，替代存在性判定）；`setup.files` 支持 `raw: true`（全文直写）。**首轮踩坑**：literal 是“往填充文本里插一行”的语义，格式敏感的 JSON fixture 混进填充字符变坏 JSON，中断交代根本没发生、被模型翻源码当场解剖（48 轮）——fixture 必须用 raw。
+
+**首轮实测（2026-10-24，trials=1）**：bash_done / disk_log / corrupt_log 3 PASS；crash_recover 首轮 FAIL（上述 fixture 坑，已修）→ 复跑遇 LLM API 402 欠费中断，**待余额恢复后复跑**（机制层已有单测 9 条 + 跨进程冒烟双证，此格补的是模型行为面）。
+
 ## 因子矩阵（compact/）
 
 被测能力 = 上下文压缩。变量五层 × 位置 × 依赖强度，格子 = 一次组合。

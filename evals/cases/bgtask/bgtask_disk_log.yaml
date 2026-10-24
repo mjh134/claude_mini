@@ -1,0 +1,36 @@
+# bgtask_disk_log — 提交即落盘:未收尾的任务必须挂在后台任务日志里(含原命令) · suite=capability
+# reference: 幕1 起一条长后台任务(不会在评测窗口内收尾);探针判两层——
+#   盘上硬证据(.task/bg_tasks.json 含原命令标记)+ 模型能报出命令原文。
+#   这就是"kill 后有东西可交代"的数据来源:没落盘,重启后什么都交代不了。
+
+id: bgtask_disk_log
+suite: capability
+factor:
+  layer: bgtask
+  position: tail
+  dependency: once
+bg_log: ".task/bg_tasks.json"
+setup:
+  files:
+  - path: seed.txt
+    chars: 300
+acts:
+- "用 bash 工具、is_background 参数设为 true，后台执行：python -c \"import time; time.sleep(180); print('BG_LOG_MARK4K')\" 。提交后告诉我任务号。"
+probe:
+  say: "你刚才提交的那条后台任务，完整命令原文是什么？"
+  expect_exact: "BG_LOG_MARK4K"
+graders:
+- type: state_check
+  probe:
+    expect_exact: "BG_LOG_MARK4K"
+  files:
+  - path: ".task/bg_tasks.json"
+    content_exact: "BG_LOG_MARK4K"
+- type: tool_calls
+  required_any:
+  - bash
+budget:
+  max_turns: 12
+  max_minutes: 4
+trials: 2
+reference: "提交后立即判定：bg_tasks.json 里必须有含 BG_LOG_MARK4K 的原命令（提交即落盘、未收尾不删）；模型也能报出命令原文。"

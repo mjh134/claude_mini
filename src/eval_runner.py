@@ -25,6 +25,7 @@ from claude import ClaudeMini
 from corn_job import Scheduler
 from mcp import MCPManager
 from task import TaskStore
+from task_runner import TaskRunner
 
 import eval_judges
 
@@ -60,13 +61,20 @@ def do_setup(case, ws):
     ctx, needle = {}, None
     spec = case.get("setup") or {}
     for f in spec.get("files") or []:
+        target = ws / f["path"]
+        target.parent.mkdir(parents=True, exist_ok=True)   #预置文件可能带子目录(如 .task/)
+        if f.get("raw"):
+            #全文直写:literal 是"往填充文本里插一行",对格式敏感的 fixture(JSON 日志等)
+            #会混进填充字符变成坏文件 —— 必须整文件就是 literal 本身,一个字不多
+            target.write_text(f["literal"], encoding="utf-8")
+            continue
         line, value = None, None
         if f.get("needle"):
             value = needle_value(case["id"])
             line = f"SECRET_TOKEN={value}\n"
         elif f.get("literal"):
             line = f["literal"]
-        (ws / f["path"]).write_text(
+        target.write_text(
             gen_text(f.get("chars", 500), line, f.get("at")), encoding="utf-8")
         if value:
             needle = {"value": value, "file": f["path"], "at": f.get("at")}
@@ -108,7 +116,7 @@ def eval_permission_hook(block):
     return None
 
 
-def build_agent():
+def build_agent(bg_log=None):
     Path(".task").mkdir(exist_ok=True)
     store = TaskStore(".task/eval_tasks.json")
     scheduler = Scheduler(".task/eval_jobs.json")
@@ -116,8 +124,15 @@ def build_agent():
     HOOKS.register_hook("PreToolUse", eval_permission_hook)
     HOOKS.register_hook("BefSubAgent", HOOKS.before_agent_hook)
     HOOKS.register_hook("AftSubAgent", HOOKS.after_agent_hook)
+    #bg_log(可选,用例顶层声明):只有测后台任务的格才带日志。TaskRunner 对它做的是
+    #显式 opt-in(见 task_runner.py):传了才有"提交落盘/收尾删/启动加载转中断交代",
+    #fixture 可以预置遗留文件来模拟"上次进程被强杀"的世界;不传的格零落盘,评测不污染日常日志。
+    #drains_results 必须跟着显式 True:显式传 task_runner 后,构造函数不再默认收割邮箱。
+    #无日志格传 None:走构造函数默认(=True),与历史行为严格一致,不许动现有格的语义
+    runner = TaskRunner(store_path=bg_log) if bg_log else None
     return ClaudeMini(show_thinking=False, silent=False, agent_name="main",
-                      task_store=store, scheduler=scheduler, mcp=mcp)
+                      task_store=store, scheduler=scheduler, mcp=mcp,
+                      task_runner=runner, drains_results=True if runner else None)
 
 
 def load_events_safely(trace_path):
@@ -163,7 +178,7 @@ def main():
     try:
         ctx, needle = do_setup(case, ws)   # 异常时 finish 也要能用，先给默认
         trial["needle"] = needle
-        agent = build_agent()
+        agent = build_agent(case.get("bg_log"))
         history = []
 
         for i, text in enumerate(case.get("acts") or [], 1):

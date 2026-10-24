@@ -1,0 +1,35 @@
+# bgtask_corrupt_log — 坏日志降级:后台任务日志损坏不许炸启动,改名留证后照常干活 · suite=capability
+# reference: fixture 预置一份损坏的 bg_tasks.json。启动加载必须降级 warning + 改名 .bad
+#   让路,agent 照常完成正常工作。判:工作照常完成(target.txt=CORRUPT_SURVIVED)+
+#   .bad 留证文件存在。
+
+id: bgtask_corrupt_log
+suite: capability
+factor:
+  layer: bgtask
+  position: head
+  dependency: corrupt
+bg_log: ".task/bg_tasks.json"
+setup:
+  files:
+  - path: ".task/bg_tasks.json"
+    raw: true
+    literal: "{oops this is not json"
+acts:
+- "把 target.txt 的内容写成 CORRUPT_SURVIVED，确认写好了。"
+probe:
+  say: "target.txt 现在的内容是什么？只回答内容本身。"
+  expect_exact: "CORRUPT_SURVIVED"
+graders:
+- type: state_check
+  probe:
+    expect_exact: "CORRUPT_SURVIVED"
+  files:
+  - path: target.txt
+    content_exact: "CORRUPT_SURVIVED"
+  - path: ".task/bg_tasks.json.bad"
+budget:
+  max_turns: 12
+  max_minutes: 4
+trials: 2
+reference: "坏日志不炸启动（agent 照常干活），坏文件被改名 .bad 留证；正常任务完成且探针可回取。"

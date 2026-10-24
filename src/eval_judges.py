@@ -76,12 +76,23 @@ def judge_state_check(trial, spec):
     for f in spec.get("files") or []:
         path = Path(trial["ws_path"]) / f["path"]
         text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else None
+        if f.get("must_absent"):
+            #反向事实:这个文件必须**不存在**(例:被中断的任务不许被重放——产物在即违规)。
+            #它**取代**默认的存在性判定而不是叠加:must_absent 的对象,"不在"才是对的
+            out.append(mk("state_check", f"file_absent:{f['path']}", text is None,
+                          "确认不存在" if text is None else "不该存在却存在(疑似被重放/误建)"))
+            continue
         out.append(mk("state_check", f"file_exists:{f['path']}", text is not None,
                       "存在" if text is not None else "文件不在"))
         if text is not None and "content_exact" in f:
             out.append(mk("state_check", f"file_content:{f['path']}",
                           f["content_exact"] in text,
                           f"期望含 {f['content_exact']!r}，实际 {replay.brief(text, 50)!r}"))
+        if text is not None and "content_absent" in f:
+            #反向内容:文件在没问题,但不得含某串(例:已交代的中断条目收尾/领走后必须从盘上消失)
+            out.append(mk("state_check", f"file_not_contain:{f['path']}",
+                          f["content_absent"] not in text,
+                          f"不得含 {f['content_absent']!r}，实际 {replay.brief(text, 50)!r}"))
     return out
 
 
