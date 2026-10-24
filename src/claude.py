@@ -16,6 +16,7 @@ from task_runner import TaskRunner, MAX_BACKGROUND_AGENTS
 from corn_job import Scheduler
 from message import Message, MessageBus
 from mcp import MCPManager
+from schema import check_schema, attach_warnings
 from team import (TeamRuntime, KIND_CHAT, KIND_OFFLINE_REQ, KIND_OFFLINE_AGREE,
                   KIND_OFFLINE_REFUSE, ALIVE, EXITING, OFFLINE, DEAD,
                   is_chat, is_control)
@@ -1055,6 +1056,13 @@ class ClaudeMini():
         if block.name not in self.allowed_tools:
             return f"❌ {block.name} 对「{self.role}」不可用。{ROLE_HINT[self.role]}"
 
+        #参数形状先过 schema。缺必填/类型错 = 硬拦,放在权限 hook 之前:
+        #格式噪声进不到权限层,hook_decision 记录才干净(阶段2 fuzzer 靠它取证)
+        errors, warnings = check_schema(self._tool_schema(block.name), block.input)
+        if errors:
+            return (f"❌ 工具 {block.name} 参数校验未通过:" + "；".join(errors)
+                    + f"\n本工具接受的参数:{self._tool_params(block.name)}。请按这个形状改对再调一次。")
+
         #prehook进行权限检查，zai
         hook_result = HOOKS.trigger_hooks("PreToolUse", block)
         #hook 的每种结局(pass/blocked+理由)都是一条判定记录——阶段2权限fuzz的核心证据源
@@ -1074,16 +1082,17 @@ class ClaudeMini():
         if block.input.get("is_background"):
             if block.name == "bash":
                 task_id = self.task_runner.submit_bash(block.input.get("command"))
-                return f"🔄 工具 {task_id} 已在后台执行。"
+                return attach_warnings(f"🔄 工具 {task_id} 已在后台执行。", warnings)
             if block.name == "subagent":
-                return self.run_subagent_background(block.input.get("prompt"))
+                return attach_warnings(
+                    self.run_subagent_background(block.input.get("prompt")), warnings)
 
         #获取工具处理函数
         handler = self.tool_registry.get(block.name)
         if handler is None:
             return f"❌ Unknown tool: {block.name}"
 
-        return self._call_tool(handler, block)
+        return attach_warnings(self._call_tool(handler, block), warnings)
 
     def _call_tool(self, handler, block):
         """调用工具 handler:把"调用姿势不对"退化成一条工具错误,绝不让异常穿出去。
@@ -1122,16 +1131,20 @@ class ClaudeMini():
             self.tool_registry.register(name, handler)
         return schemas
 
-    def _tool_params(self, name):
-        """从工具 schema 里取参数名 —— 报错时要把它回给模型,模型记不住 schema 写了什么"""
+    def _tool_schema(self, name):
+        """按名字取工具的 input_schema。查不到返回 {} —— 交 check_schema 降级:无法校验的键只警告不拦。"""
         for tool in self.tools:
             if tool.get("name") == name:
-                schema = tool.get("input_schema", {})
-                props = schema.get("properties", {})
-                required = schema.get("required", [])
-                return ", ".join(
-                    f"{k}(必填)" if k in required else k for k in props) or "(无参数)"
-        return "(未知工具)"
+                return tool.get("input_schema", {})
+        return {}
+
+    def _tool_params(self, name):
+        """从工具 schema 里取参数名 —— 报错时要把它回给模型,模型记不住 schema 写了什么"""
+        spec = self._tool_schema(name)
+        props = spec.get("properties", {})
+        required = spec.get("required", [])
+        return ", ".join(
+            f"{k}(必填)" if k in required else k for k in props) or "(无参数)"
 
     #结构化后台任务消息
     #kind/status 都要报:模型看到"子agent 已失败"才会去补救,只报"已完成"它会当成成功

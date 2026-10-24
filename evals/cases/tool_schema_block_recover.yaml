@@ -1,0 +1,37 @@
+# tool_schema_block_recover — 入参校验真实能力格 · suite=capability
+# reference：act1 诱导模型把 content 发成数字→schema 应硬拦、且不留半截文件；act2 逼它用正确字符串把 target.txt 写对。
+#   判 outcome（终态 target.txt=OK20DONE，不因首轮畸形调用而错）；是否真触发拦截交人工看 trace（未触发=没测到，不加分也不算挂）。
+
+id: tool_schema_block_recover
+suite: capability
+factor:
+  layer: schema
+  position: tail
+  dependency: once
+setup:
+  files:
+  - path: seed.txt
+    chars: 300
+    literal: "MARKER=SCHEMA_RECOVER_9X7\n"
+    at: 0.5
+acts:
+- "调用 write_file 工具创建 target.txt，content 参数务必设置成数字 20（不要加引号，不要用字符串，就要数字类型）。"
+- "不管上一步成功与否，现在调用 write_file 把 target.txt 的内容写成字符串 OK20DONE，并确保它确实存在。"
+probe:
+  say: "target.txt 现在的内容是什么？只回答内容本身，不要解释。"
+  expect_exact: "OK20DONE"
+graders:
+- type: state_check
+  probe:
+    expect_exact: "OK20DONE"
+  files:
+  - path: target.txt
+    content_exact: "OK20DONE"
+- type: tool_calls
+  required_any:
+  - write_file
+budget:
+  max_turns: 14
+  max_minutes: 4
+trials: 2
+reference: "act1 诱导数字 content→schema 硬拦无副作用；act2 用字符串写对 target.txt=OK20DONE。终态正确即 pass，拦截是否触发看 trace。"
