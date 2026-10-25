@@ -69,9 +69,15 @@ class TaskRunner:
     #僵尸回收交代);bench/eval 更不能把评测垃圾写进日常库。谁需要恢复能力谁显式传。
     #只存"未收尾"的任务:提交时登记、收尾时删条目 —— 盘上存在 = 被中断,_load 零分支。
     #已完成未领取的结果**不落盘**:工作已经做完,丢的只是通知,不算中断
-    def __init__(self, id_prefix="bg", store_path=None):
+    #stop_event(可选):取消信号。不传自建(行为不变);传了就用外部的那个 ——
+    #“要退出了”是**进程级**的事实,但 runner 有好几份(主对话/派发器/每个成员/
+    #每个 job agent 各一份),各持各的 event 的话,主线程 cancel_all 置了自己那份,
+    #别的 runner 名下在跑的任务一个都收不到。所以建 runner 时把共享的那个传进来
+    #(主对话/子 agent 共享整个 runner 实例,天然同一个;成员/Job agent 走构造参数)
+    def __init__(self, id_prefix="bg", store_path=None, stop_event=None):
         self.id_prefix = id_prefix
         self.store_path = Path(store_path) if store_path else None
+        self.stop_event = stop_event if stop_event is not None else threading.Event()
         self.tasks = {}         # task_id -> _record() 那份形状(含 thread / on_done)
         self.ready = []         # 已完成、等待领取的 task_id(邮箱)
         self.results = {}       # task_id -> {"kind", "status", "output"}
@@ -125,10 +131,10 @@ class TaskRunner:
         self._attach_thread(task_id, thread)
         return task_id
 
-    #执行体:bash
+    #执行体:bash。取消信号传下去:execute_bash 在轮询档里看到置位就杀树返回
     def _run_bash(self, task_id, command):
         try:
-            output, exit_code = execute_bash(command)
+            output, exit_code = execute_bash(command, stop_event=self.stop_event)
             status = "completed" if exit_code == 0 else "failed"
         except BaseException as e:      #BaseException 是故意的,理由见 _run_agent
             output = f"{type(e).__name__}: {e}"
@@ -398,6 +404,16 @@ class TaskRunner:
     def has_agent_slot(self):
         with self.lock:
             return self.agents_running < MAX_BACKGROUND_AGENTS
+
+    #广播取消(退出路径的第一步,ROADMAP 项 8):置 stop_event,本 runner 及共享同一
+    #event 的所有 runner 名下的执行体在下个检查点/轮询档里停下来 —— bash 最坏一档
+    #(_POLL_SECONDS)内被杀树;后台 agent 在途的 LLM 请求让它落地,落地后由 run() 开头
+    #的检查点兜住,不再发起新请求。返回此刻仍在跑的 task_id 快照(调用方报数用)。
+    #幂等:event 重复 set 是 no-op。配套用法见 wait_running:先 cancel_all 再等待,
+    #等不进窗口的任务盘上登记还在,重启转中断交代(和项 7 同一条恢复线)
+    def cancel_all(self):
+        self.stop_event.set()
+        return self.running()
 
     #退出前的有界等待:返回仍**在跑**的 task_id 列表(空 = 全跑完了)
     #和"等结果"是两回事:已经跑完但没被领走的那批不在此列 —— 它们已经落在 self.results 里

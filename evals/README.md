@@ -44,7 +44,7 @@ evals/cases/
 
 为此组新增的基建：`state_check.files` 支持 `content_absent`（存在但不得含）/ `must_absent`（必须不存在，替代存在性判定）；`setup.files` 支持 `raw: true`（全文直写）。**首轮踩坑**：literal 是“往填充文本里插一行”的语义，格式敏感的 JSON fixture 混进填充字符变坏 JSON，中断交代根本没发生、被模型翻源码当场解剖（48 轮）——fixture 必须用 raw。
 
-**首轮实测（2026-10-24，trials=1）**：bash_done / disk_log / corrupt_log 3 PASS；crash_recover 首轮 FAIL（上述 fixture 坑，已修）→ 复跑遇 LLM API 402 欠费中断，**待余额恢复后复跑**（机制层已有单测 9 条 + 跨进程冒烟双证，此格补的是模型行为面）。
+**首轮实测（2026-10-24，trials=1）：4/4 PASS**。crash_recover 两轮调优记档，都是评测体系在抓真问题：①首轮 FAIL——fixture 踩 literal 语义坑（混入填充文本变坏 JSON，中断交代根本没发生，被模型翻源码当场解剖，48 轮）→ 修出 `raw` 直写；②二轮 FAIL——机制层六条断言全过、6 轮完成，唯独字面匹配“中断”二字太脆（模型说“断掉/进程没了”语义全对被挂）→ 删字面判据，“通知送达且被利用”由命令原文回取证明（盘已清空，原文只可能来自通知），“以为还在跑”的真反例答不出原文、被 probe_answer 自然抓住。
 
 ## 因子矩阵（compact/）
 

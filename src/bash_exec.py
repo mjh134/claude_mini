@@ -4,6 +4,7 @@ import os
 import shutil
 import signal
 import subprocess
+import time
 
 
 def resolve_bash():
@@ -54,8 +55,38 @@ def _kill_tree(pid):
             pass
 
 
-def execute_bash(command, timeout=300):
-    """同步执行一条 bash 命令,返回 (output, exit_code),永不抛错。"""
+#轮询档长:等待子进程时每隔多久醒一次去看取消信号,也是取消响应的上界 ——
+#信号置位后最坏再等一个档就杀树。对 300s 的正常超时,这点精度损失可忽略
+_POLL_SECONDS = 0.5
+
+
+#execute_bash 的内部取消信号:_wait 杀完树后抛出,execute_bash 接住转成取消文案。
+#不复用 TimeoutExpired:取消和超时是两回事,文案要分得清(模型/用户要看懂为什么停)
+class _Cancelled(Exception):
+    pass
+
+
+def _drain(proc, timeout=3):
+    """树杀掉以后把管道收干净,免得留下半开的句柄。
+
+    超时只给 3s:实测被杀的子进程遗下的管道句柄要过一会儿才真的关,
+    communicate 会一直等到超时。给 10s 就是白等 10s(实测一次超时总耗时 16.7s)
+    —— 超时本来就已经是坏事,别在它后面再挂一段没用的等待。
+    """
+    try:
+        proc.communicate(timeout=timeout)
+    except Exception:
+        pass
+
+
+def execute_bash(command, timeout=300, stop_event=None):
+    """同步执行一条 bash 命令,返回 (output, exit_code),永不抛错。
+
+    stop_event(可选):取消信号(ROADMAP 项 8 取消传播)。给了的话,等待从
+    "一次等满 timeout"改成按 _POLL_SECONDS 一档轮询,每档醒来先看信号 ——
+    置位就杀整棵树并立即返回取消文案。不给(默认)行为与以前一致:
+    eval/bench/前台正常路径零影响。
+    """
     bash = resolve_bash()
 
     if bash is None:
@@ -87,24 +118,22 @@ def execute_bash(command, timeout=300):
                 0
             ),
         )
-        stdout, stderr = proc.communicate(timeout=timeout)
+        stdout, stderr = _wait(proc, timeout, stop_event)
         returncode = proc.returncode
+    except _Cancelled as e:
+        return str(e), -1
     except subprocess.TimeoutExpired:
-        if proc is not None:
-            _kill_tree(proc.pid)
-            try:
-                #树杀掉以后把管道收干净,免得留下半开的句柄。
-                #超时只给 3s:实测被杀的子进程遗下的管道句柄要过一会儿才真的关,
-                #communicate 会一直等到超时。给 10s 就是白等 10s(实测一次超时总耗时 16.7s)
-                #—— 超时本来就已经是坏事,别在它后面再挂一段没用的等待。
-                proc.communicate(timeout=3)
-            except Exception:
-                pass
         return f"命令执行超时({timeout}s)", -1
     except Exception as e:
-        if proc is not None:
-            _kill_tree(proc.pid)
         return str(e), -1
+    finally:
+        #★ Ctrl+C 的落点。KBI 是 BaseException,上面几个 except 都接不住它,
+        #但 finally 必跑:进程还活着(被 Ctrl+C 打断的那一刻正是活着)就杀整棵树,
+        #然后让 KBI 照常穿出去走 main 的收尾 —— 不吞、不重抛、不干扰。
+        #正常跑完/超时杀过/取消杀过的情况下 poll() 已返回退出码,None 才是"还活着",
+        #所以这个判断同时保证了"该杀时杀、不该杀时不杀"(正常路径它不会动手)
+        if proc is not None and proc.poll() is None:
+            _kill_tree(proc.pid)
 
     # 失败时把 stdout 一并带上:命令常常先有输出再报错,只给 stderr 会丢掉前半截现场
     if returncode == 0:
@@ -113,3 +142,26 @@ def execute_bash(command, timeout=300):
         output = stdout + stderr
 
     return output, returncode
+
+
+def _wait(proc, timeout, stop_event):
+    """等子进程跑完,返回 (stdout, stderr);超时/取消路径杀树后抛对应异常。
+
+    ★ 为什么轮询而不是 communicate(timeout=timeout) 一次等满:取消信号
+      最长只能等一个档,一次等满会把信号晾在整段 timeout 里。
+      communicate 短超时抛 TimeoutExpired 不丢已收的输出(Python 3 保证
+      重试 communicate 不会丢),所以按档重试是安全的。
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            return proc.communicate(timeout=_POLL_SECONDS)
+        except subprocess.TimeoutExpired:
+            if stop_event is not None and stop_event.is_set():
+                _kill_tree(proc.pid)
+                _drain(proc)
+                raise _Cancelled("命令被取消(收到停止信号),没有执行完")
+            if time.monotonic() > deadline:
+                _kill_tree(proc.pid)
+                _drain(proc)
+                raise subprocess.TimeoutExpired(proc.args, timeout)

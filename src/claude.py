@@ -183,6 +183,14 @@ class ClaudeMini():
 
         
         while True:
+            #取消检查点(ROADMAP 项 8):停止信号是进程级的退出广播,查到就不再发起新的
+            #LLM 请求,带一句说明返回 —— 它会作为后台任务的结果文本/成员的回复送回去。
+            #主 agent 自己跑在主线程,Ctrl+C 时 KBI 直接打断在途请求,这个检查点对它
+            #只是兜底;真正靠它停下的是后台子 agent / 成员 / 定时任务线程(KBI 到不了那里)
+            if self.task_runner.stop_event.is_set():
+                done = max(0, self.trace_turn)
+                return (f"任务在用户退出进程时被取消,没有跑完;已进行 {done} 轮。"
+                        f"需要的话重新提交。")
             #重试圈也计数:重试次数正是"故障恢复"维度的原始数据,回放要看得见
             self.trace_turn += 1
             #收集后台任务执行结果
@@ -331,7 +339,10 @@ class ClaudeMini():
         self.running = True
         self._team_history = team_history = []   # 跨消息保留
 
-        while self.running:
+        #停止信号(进程级退出广播)也进循环条件:置位后即使被新消息唤醒,
+        #也不开始新的工作期。空闲时挂在 receive 里醒不来没关系 —— 它没有未完成的活,
+        #daemon 线程随进程退出即可
+        while self.running and not self.task_runner.stop_event.is_set():
             # ↓ idle 阻塞点:没有发给自己的消息时,线程挂在 bus 的 receive 里(0 CPU),
             #   普通消息和控制消息都能把它唤醒 —— 不用轮询、不用定时唤醒(设计.md 十二)
             self.state = "idle"
@@ -465,10 +476,15 @@ class ClaudeMini():
 
         #成员:身份是 team_member,所以它天然没有"建团队/起子agent/写记忆/领定时任务"这些工具
         #(表在 TOOLS.ROLE_DENIED);共享总线、成员表、任务库、调度器、MCP
+        #邮箱必须成员自建(通知进成员自己的历史,所以 drains_results 显式 True 保持原行为),
+        #但取消信号必须和主 runner 同一个:退出广播是进程级的,不然主线程 cancel_all
+        #之后,成员名下在跑的后台任务一个都收不到停止信号
         teammate = ClaudeMini(role=ROLE_MEMBER, agent_name=name, agent_id=member.id,
                               message_bus=self.message_bus, team_runtime=runtime,
                               task_store=self.task_store, scheduler=self.scheduler,
-                              mcp=self.mcp)
+                              mcp=self.mcp,
+                              task_runner=TaskRunner(stop_event=self.task_runner.stop_event),
+                              drains_results=True)
         thread = threading.Thread(target=teammate.run_forever, name=member.id, daemon=True)
         thread.start()
         runtime.update(member.id, agent=teammate, thread=thread)

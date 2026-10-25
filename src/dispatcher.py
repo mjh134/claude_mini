@@ -115,7 +115,11 @@ class JobDispatcher:
             #drains_results=True 是必须的:这份邮箱**只有它一个读者**(派发器读的是自己那份),
             #不显式说一声,构造函数会按"别人给的邮箱"默认当成不收,任务就再也看不见
             #自己起的后台任务跑出什么了
-            task_runner=TaskRunner(id_prefix=task_id),
+            #stop_event 用派发器那份:退出广播是进程级的,主线程 cancel 的是派发器的
+            #runner,任务 agent 自己这份 runner 不接同一个信号的话,它名下在跑的活
+            #和 run() 检查点全都收不到停止信号
+            task_runner=TaskRunner(id_prefix=task_id,
+                                   stop_event=self.runner.stop_event),
             drains_results=True,
             #团队工具必须挡掉:这个实例是 ROLE_MAIN,但它**不拥有一棵长命的树** ——
             #TeamRuntime 和 MessageBus 都是它自己新建的,任务一结束就随它一起没了。

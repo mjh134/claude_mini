@@ -1,3 +1,4 @@
+import argparse
 import queue
 import threading
 import HOOKS
@@ -6,23 +7,35 @@ import trace
 from claude import ClaudeMini
 from dispatcher import JobDispatcher
 from llm import explain_error
+from session_store import save_session, load_session
 from task_runner import TaskRunner
 import skill
 
 
+#会话存档的落盘位置。跟随 .task/ 的 cwd 相对纪律(paths.py 注释:它们靠
+#“从项目根启动”的纪律保证,不走 PROJECT_ROOT 锡定)
+SESSION_PATH = ".task/session.json"
 
-def run_turn(claude_mini, history):
+
+def run_turn(claude_mini, history, session_path=None):
     try:
         claude_mini.run(history)
     except Exception as e:
         ui.error(f"这一轮失败了,已经中断:{explain_error(e)}")
         ui.status("会话还在,可以直接重说一次。")
+    finally:
+        #写点 = 本轮出 run() 之后(ROADMAP 项 9):只有这里才是 tool_use 与
+        #tool_result 成对、压缩完成的点 —— 盘上永远是合法 history,加载侧零修复分支。
+        #代价:本轮中途被强杀时不落盘,丢的是正在跑的那一轮,与“只交代不重放”同哲学。
+        #失败路径也保存:异常穿出 run() 时 history 仍是上一轮结束的合法状态
+        if session_path:
+            save_session(history, session_path)
 
 
 
 #用户输入循环
 #主agent有三条唤醒来源:① 用户敲键盘 ② 团队成员发消息 ③ 后台任务跑完了。
-def user_loop(history,claude_mini:ClaudeMini):
+def user_loop(history,claude_mini:ClaudeMini, session_path=None):
 
     inbox = queue.Queue()
 
@@ -57,7 +70,7 @@ def user_loop(history,claude_mini:ClaudeMini):
 
                 claude_mini.task_runner.reap_dead()
                 if claude_mini.has_team_message() or claude_mini.task_runner.has_completed():#只唤醒agent，消息在run的开头处理
-                    run_turn(claude_mini, history)    #run_turn 里会把 <team_message> 和 <task_notification> 收进 history
+                    run_turn(claude_mini, history, session_path)    #run_turn 里会把 <team_message> 和 <task_notification> 收进 history
                 continue
 
             if message is None or message.lower() in ["q"]:
@@ -69,11 +82,15 @@ def user_loop(history,claude_mini:ClaudeMini):
                 continue
             history.append({"role": "user", "content": message})
             #agent循环
-            run_turn(claude_mini, history)
+            run_turn(claude_mini, history, session_path)
     except KeyboardInterrupt:           #Ctrl+C 落在主线程
         ui.status("退出。")
 
 if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--resume", action="store_true",
+                    help="恢复上次会话(断点续聊),上下文从上次结束处继续")
+    args = ap.parse_args()
 
     #显式初始化观测面(而不是等第一次建 agent 时懒建):
     #启动那一刻就把文件建出来,建不起来当场告警,别等对话到一半才发现没留 trace
@@ -100,17 +117,30 @@ if __name__ == "__main__":
     ui.banner([("Claude Mini", "bold"), ("   输入 q 退出", "dim")])
 
     history = []
-    user_loop(history,claude_mini)
+    if args.resume:
+        #--resume:盘上是 run_turn 收尾点的合法 history,加载即用、零修复分支。
+        #无文件/坏文件降级开新会话 —— 恢复面不能反过来把启动卡死
+        loaded = load_session(SESSION_PATH)
+        if loaded is not None:
+            history = loaded
+            ui.status(f"已恢复上次会话({len(history)} 条消息),接着聊。")
+        else:
+            ui.status("没有找到上次会话,开新会话。")
+    user_loop(history,claude_mini, SESSION_PATH)
 
-    #退出前给后台任务留一个有界等待。后台任务跑在守护线程上,进程一退就被硬杀 ——
-    #写到一半的文件/记忆可能只落了一半。以前 run() 里那道最多等 300s 的闸就是顺手挡这个的,
-    #现在改成真异步,那道闸没了,所以必须在这里补一道,否则用户随时能按 q 把正在写盘的任务斩断。
-    #两条通道各等各的:定时任务是派发器名下那份执行器,不在主对话那份里。
+    #退出前先广播取消、再给有界等待(ROADMAP 项 8:先 cancel_all 再等待)。
+    #后台任务跑在守护线程上,进程一退就被硬杀 —— 写到一半的文件/记忆可能只落一半。
+    #以前 run() 里那道最多等 300s 的闸没了之后,这里就是唯一收尾点;q 和 Ctrl+C
+    #两条退出路都汇到它,取消点也因此唯一 —— cancel_all 置进程级停止信号:
+    #bash 在轮询档内被杀树,后台 agent 跑完在途请求后由 run() 检查点停住;
+    #10 秒内停不下来的(多半是在途 LLM 请求没落地),盘上登记还在,下次启动转中断交代。
     #先报一声再等 —— 否则按 q 之后会静默卡住几秒,看起来像死机
+    claude_mini.task_runner.cancel_all()
+    dispatcher.runner.cancel_all()
     pending_main = claude_mini.task_runner.running()
     pending_jobs = dispatcher.runner.running()
     if pending_main or pending_jobs:
-        ui.status("还有后台任务在跑,等它们收尾(每条通道最多 10 秒)…")
+        ui.status("已发停止信号,等后台任务收尾(每条通道最多 10 秒)…")
         left_main = claude_mini.task_runner.wait_running(timeout=10)
         left_jobs = dispatcher.runner.wait_running(timeout=10)
         left = left_main + left_jobs

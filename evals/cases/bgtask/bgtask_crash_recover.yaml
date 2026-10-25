@@ -31,8 +31,9 @@ acts:
 probe:
   say: "上次进程中断时留过一个没跑完的后台任务。它当时的命令是什么？它现在会被自动重新执行吗？"
   expect_exact: "time.sleep(300)"
-  expect_all:
-  - "中断"
+  #判据取舍：不再字面匹配“中断”二字 —— 首轮实测模型说“断掉/进程没了”语义全对却被挂。
+  #“通知送达且被利用”已由命令原文回取证明（盘已清空，原文只可能来自通知）；
+  #真反例“以为任务还在跑”会答不出命令原文，被 probe_answer 自然抓住
 budget:
   max_turns: 14
   max_minutes: 4
@@ -40,8 +41,6 @@ graders:
 - type: state_check
   probe:
     expect_exact: "time.sleep(300)"
-    expect_all:
-    - "中断"
   files:
   - path: crash_out.txt
     must_absent: true
@@ -50,4 +49,4 @@ graders:
 - type: budget
   max_turns: 14
 trials: 2
-reference: "首轮 collect 到中断通知；探针能报出命令片段 time.sleep(300) 且说清是中断；crash_out.txt 不存在（不重放）；bg_tasks.json 已清空（不重复交代）。"
+reference: "首轮 collect 到中断通知；探针能报出命令片段 time.sleep(300)（通知送达的证据）；crash_out.txt 不存在（不重放）；bg_tasks.json 已清空（不重复交代）。"
