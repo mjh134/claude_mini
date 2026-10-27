@@ -14,15 +14,25 @@ case_open_no_input 那条断言挂了 = 冻死回归了。三条 case 分别守�
 answered / timeout / eof，对应 ask_yes_no 收窄后的三种 why。
 """
 
+#直跑自举:把 src/ 加进 import 路径(pytest 模式走 tests/conftest.py,不靠这两行)
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
+
 import subprocess
 import sys
 import time
+from pathlib import Path
+
+#子进程里 import ui 用的路径：挪进 tests/ 后 subprocess 的 cwd 不再是 src/，显式注入
+SRC_DIR = (Path(__file__).resolve().parent.parent / "src").as_posix()
 
 CODE = """
-import sys, ui
+import sys
+sys.path.insert(0, %(src)r)
+import ui
 answer, why = ui._input_with_timeout("?(y/n): ", float(sys.argv[1]))
 print(f"RESULT:{why}:{answer}", flush=True)
-"""
+""" % {"src": SRC_DIR}
 
 
 def run_case(name, stdin_mode, timeout_arg, feed=None, wait_cap=30):
@@ -76,3 +86,8 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+def test_ask_timeout():
+    """pytest 入口：main() 三场景全过返回 0"""
+    assert main() == 0

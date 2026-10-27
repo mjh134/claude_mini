@@ -18,6 +18,10 @@
 少一条就成了漏洞,而且这组用例会长久地替下一次改动守着这个边界。
 """
 
+#直跑自举:把 src/ 加进 import 路径(pytest 模式走 tests/conftest.py,不靠这两行)
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
+
 import sys
 
 from PERMISSIONS import Permission, check_bash_permission

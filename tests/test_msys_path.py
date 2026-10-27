@@ -17,6 +17,10 @@ read_file 用 /d/ 风格路径真能读到、touches_memory 用 /d/ 风格路径
 —— 后者是权限一致性:工具和权限必须吃同一种解析,漏接一边就是绕过面。
 """
 
+#直跑自举:把 src/ 加进 import 路径(pytest 模式走 tests/conftest.py,不靠这两行)
+import os as _os, sys as _sys
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "..", "src"))
+
 import os
 import sys
 import tempfile
