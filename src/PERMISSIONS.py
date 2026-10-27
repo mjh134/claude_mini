@@ -4,6 +4,7 @@ import shlex
 from enum import Enum
 
 import paths
+from paths import msys_to_win
 
 class Permission(Enum):
     ALLOW = "allowed"
@@ -488,16 +489,19 @@ def _memory_root():
 def touches_memory(path):
     """这个写入目标是不是落在长期记忆库里。
 
-    解析方式必须和 run_write 真正落盘的方式一致:run_write 用的是 Path(path),
+    解析方式必须和 run_write 真正落盘的方式一致:run_write 用的是 Path(msys_to_win(path)),
     相对路径 ⇒ 相对于**进程 cwd**。所以这里也走 abspath,而不是拿 _memory_root() 去拼字符串 ——
     这样 "memory/x.md" 和 "D:/…/memory/x.md" 两种写法会归到同一个绝对路径,
     "./a/../memory/x.md" 这种绕法也会在 abspath 里被规范化掉。
+    msys_to_win 同样是"一致"的一部分:run_write 接了它,/d/.../memory/x.md 这种
+    Git Bash 风格写法不跟着接的话,工具会写到真实记忆库而这里却算成"当前盘的 d 目录"
+    —— 记忆写保护整条被绕过。
     normcase:Windows 路径不分大小写,"MEMORY/" 和 "memory/" 是同一个目录。
     比前缀时带上分隔符,免得 "…/memory_backup/" 被误判成 "…/memory/" 的子目录。
     解析失败按"碰了"处理(交给调用方 ASK):权限检查自己出错时该往严的方向倒,不能放行。
     """
     try:
-        target = os.path.normcase(os.path.abspath(path))
+        target = os.path.normcase(os.path.abspath(msys_to_win(path)))
         root = os.path.normcase(os.path.abspath(_memory_root()))
     except Exception:
         return True

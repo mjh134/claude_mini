@@ -1,6 +1,7 @@
 from pathlib import Path
 import skill
 from bash_exec import execute_bash
+from paths import msys_to_win
 
 Tools = [
     {
@@ -512,7 +513,9 @@ def run_bash(command, timeout=300, **_ignored):
     
 def run_read(path, limit=None):
     try:
-        file_path = Path(path)
+        #msys_to_win:模型的路径习惯从 bash 输出里学来(/d/... 风格),bash 工具吃得下,
+        #这里不归一的话 read 永远"文件不存在"(见 paths.msys_to_win 的注释)
+        file_path = Path(msys_to_win(path))
         if not file_path.exists():
             return f"文件不存在: {path}"
         if not file_path.is_file():
@@ -533,7 +536,9 @@ def run_write(path, content):
     再看内容类型、再看目标是不是目录,最后才动手写 —— 免得写了一半才发现不该写。
     """
     try:
-        file_path = Path(path)
+        #msys_to_win:与 run_read 同理。写比读更险 —— /d/x 会被解析成"当前盘根的
+        #d 目录",静默写错位置而不报错(见 paths.msys_to_win 的注释)
+        file_path = Path(msys_to_win(path))
 
         #.env 里是真实 API key,写坏了只能手工找回。
         #按文件名判断而不是整条路径,所以 D:/x/.env、./.env、.env.local 都会拦下

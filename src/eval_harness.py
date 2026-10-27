@@ -62,7 +62,11 @@ def run_trial(case, trial_no):
     trial_dir.mkdir(parents=True)
 
     minutes = float((case.get("budget") or {}).get("max_minutes", DEFAULT_MINUTES))
-    cmd = [sys.executable, str(SRC / "eval_runner.py"),
+    #交互格(runner: interactive)走真实 CLI 入口(main.py 管道驱动,弹窗自动应答),
+    #其余格走进程内 eval_runner —— 判定器是同一套,报告无感知
+    runner_script = ("eval_interactive_runner.py"
+                     if case.get("runner") == "interactive" else "eval_runner.py")
+    cmd = [sys.executable, str(SRC / runner_script),
            "--case", case["_path"], "--trial-dir", str(trial_dir),
            "--trial-no", str(trial_no)]
     started = time.time()
@@ -154,8 +158,9 @@ def main():
             print(f"\n[{g}]  {len(by_group[g])} 格")
             for c in by_group[g]:
                 f = c.get("factor") or {}
+                tag = " [interactive]" if c.get("runner") == "interactive" else ""
                 print(f"  {c['id']:<28} {c.get('suite','?'):<12} "
-                      f"layer={f.get('layer','?'):<9} pos={f.get('position','?'):<7} dep={f.get('dependency','?')}")
+                      f"layer={f.get('layer','?'):<9} pos={f.get('position','?'):<7} dep={f.get('dependency','?')}{tag}")
         return 0
     if not cases:
         print(f"evals/cases/ 下（递归）没有匹配的用例（only={only or '全部'} group={args.group or '全部'}）", file=sys.stderr)

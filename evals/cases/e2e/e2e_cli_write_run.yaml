@@ -1,0 +1,41 @@
+# e2e_cli_write_run — 真实 CLI 入口基本链路 · suite=capability · runner=interactive
+# reference: 走 python src/main.py 真实入口（输入循环/会话存档全在路径上）做一条
+#   写文件→运行→汇报的最小任务链。判 outcome：盘上文件含独特标记 + 探针答出运行输出。
+#   与库层格的区别：main.py 的 user_loop/run_turn/session.json 落盘都在被测路径上。
+
+id: e2e_cli_write_run
+runner: interactive
+suite: capability
+factor:
+  layer: cli_e2e
+  position: single
+  dependency: once
+setup:
+  files:
+  - path: seed_marker.txt
+    chars: 200
+    literal: "seed for e2e\n"
+acts:
+- "在 out/ 目录下创建 hello_e2e.py：运行时打印一行 E2E-OK-{{needle}}（就这一行）。写完后运行它，把输出原样贴给我。"
+probe:
+  say: "hello_e2e.py 刚才的运行输出是什么？只回答那一行内容本身。"
+  expect_exact: "E2E-OK-{{needle}}"
+graders:
+- type: state_check
+  probe:
+    expect_exact: "E2E-OK-{{needle}}"
+  files:
+  - path: out/hello_e2e.py
+    content_exact: "E2E-OK-{{needle}}"
+- type: tool_calls
+  required_any:
+  - write_file
+- type: budget
+  max_turns: 14
+budget:
+  max_turns: 14
+  max_minutes: 5
+permissions:
+  default: y
+trials: 1
+reference: "真实入口写脚本→运行→探针答出 E2E-OK-<needle>；盘上脚本含标记。"

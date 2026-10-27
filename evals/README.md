@@ -70,6 +70,45 @@ evals/cases/
 
 \* **micro 观测盲区**：micro 的 span 记 before/after=len(history)，原地替换内容条数永不变——用 trace 判「micro 触发了」结构性不可能。该格 pressure 断言用 budget 作代理（文件 2500 字逼 budget 触发，needle 在 0.4<2000 不被截），micro 本身的效果由探针回取测。要真观测需给写侧 micro span 加 replaced 计数（动 claude.py 一行，待人批）。
 
+## e2e/：真实 CLI 入口端到端（交互式运行器）
+
+被测能力 = **`python src/main.py` 这条真实入口本身**：输入循环、权限弹窗（人工应答）、
+session 存档、`--resume`。与上面各组的分工：
+
+| 执行器 | 驱动方式 | 权限 ASK 处置 | 测得到 |
+|---|---|---|---|
+| `eval_runner.py`（其余组） | 进程内 import ClaudeMini | 一律拒绝（无人值守） | 库层能力 |
+| `eval_interactive_runner.py`（e2e 组，用例带 `runner: interactive`） | spawn 真实 main.py 子进程，管道逐幕驱动 | **弹窗自动应答**（`permissions.default: y/n`） | CLI 端到端 |
+
+用例 YAML 与库层格同格式（acts/probe/graders 判定器共用），交互专属字段：`runner: interactive`、
+`permissions.default`、`resume:`（第一段 EOF 退出后 spawn `--resume` 跑第二段，探针取第二段）。
+轮次同步信号 = `<工作区>/.task/session.json` 落盘变化（run_turn 收尾必写）——stdout 的
+`User:` 提示符是队列式输入信号，agent 干活时读线程也会打它，不能当轮次边界（首轮实测踩过）。
+
+| 格 | 因子 | 判据 |
+|---|---|---|
+| e2e_cli_write_run | 入口×基本链路 | 写脚本+运行，盘上文件与探针都含独特标记 E2E-OK-<needle> |
+| e2e_permission_allow | 弹窗×应允 | cp 触发弹窗应 y → copy_ask.txt 落盘且内容与 seed 一致 |
+| e2e_permission_deny | 弹窗×拒绝 | 应 n → copy_deny.txt **must_absent**（拒了还落盘=穿透）；同参 cp ≤1 次（不重试） |
+| e2e_session_resume | 入口×恢复 | 第一段记暗号 → EOF → --resume 新进程探针答出暗号 |
+
+**首轮实测（2026-10-26，trials=1）：4/4 PASS**。顺手抓到两条真问题：
+
+1. **agent bug（✅ 已修 2026-10-27，配 25s 表）**：管道模式（非 tty）下弹窗 fallback `input()`
+   （主线程）与读线程 `input("User: ")` 抢同一 stdin——应答被读线程吃掉后，主线程原本
+   **无超时永久卡死**（`ask_sync` 的 25s 超时只在 prompt_toolkit 路径生效）。修法：
+   fallback 分支改走 `ui._input_with_timeout`（daemon 线程 + `ev.wait(timeout)`，超时按
+   拒绝），`src/test_ask_timeout.py` 三场景守回归（answered/timeout/eof，其中"开着不喂"
+   就是冻死的最小复刻）。运行器里的补喂补偿保留为深防御（8s < 25s，表来不及触发）。
+   已知语义变化：弹窗期间 Ctrl+C 从"拒绝这条继续跑"变成"中断整轮"（KBI 直接上穿），
+   与 user_loop 的中断哲学一致。
+2. **fixture 坑（已修）**：`setup.files` 的 `literal` 是"往填充文本插一行"语义，
+   **必须配 `at`**，否则插不进去（内容判据静默失效）——格式敏感 fixture 一律 `raw: true`，
+   与 bgtask 组的教训同源。
+
+另外运行器每次跑前备份、跑后恢复 `PROJECT_ROOT/memory`（agent 写记忆走源码锚定，
+不随工作区 cwd），评测对真实记忆零污染。
+
 ## 判据（三层，只判 L1/L2）
 
 - `state_check`：探针回取（子串精确匹配预埋值）、环境文件事实。

@@ -866,6 +866,44 @@ def wait_for_app(timeout=2.0, spin=0.002):
         time.sleep(spin)
 
 
+def _input_with_timeout(text, timeout):
+    """裸 input() 的带表版本 —— 管道模式(fallback)的弹窗读取专用。
+
+    为什么不能直接 input():它没有"等多少秒"的概念,可以永久阻塞。管道模式下
+    读线程(read_input_plain)也一直蹲在 stdin 上 —— 弹窗的应答有概率被它抢走
+    (两个阻塞读者抢同一根管道,谁调度到谁拿走,e2e 评测 2026-10-26 实测复现),
+    主线程必须自己带表:超时按拒绝处理,而不是把整条主循环冻死在 input() 里。
+    tty 模式不需要这层:那条路走 run_in_terminal 借终端,所有权唯一,且已有
+    ev.wait(timeout) 的表(见下面 ask_sync 的 PT 分支)。
+
+    代价(知情取舍):超时后这个 daemon 线程还挂在 stdin 上,迟到的回答会被丢弃
+    (语义正确 —— 超时即拒绝已生效),但它仍会参与后续输入的读者竞争;脏,
+    但比把主循环冻死强得多。
+
+    KeyboardInterrupt 的行为变化:input() 挪进 daemon 线程后,Ctrl+C 不再被这里
+    吞成 'eof'(Python 的信号只投递给主线程,现在主线程阻塞在 ev.wait 上,KBI
+    直接中断等待往上穿) —— 弹窗期间按 Ctrl+C 从"拒绝这一条继续跑"变成"中断整轮"。
+    这与 user_loop 的判定一致:会按 Ctrl+C 的场景几乎都是"有东西卡住了想中断"。
+    """
+    box, ev = {}, threading.Event()
+
+    def read():
+        try:
+            box["v"] = input(text)
+        except BaseException as e:
+            box["e"] = e
+        finally:
+            ev.set()
+
+    threading.Thread(target=read, daemon=True, name="ask-sync-input").start()
+    if not ev.wait(timeout):
+        _log(f"ask_sync: fallback {timeout}s 没等到回答,按拒绝处理")
+        return None, "timeout"
+    if "e" in box:
+        return None, "eof"
+    return box.get("v"), "fallback"
+
+
 def ask_sync(text, timeout=25):
     """问用户一句话,阻塞等回答。返回 (answer, why)。
 
@@ -886,11 +924,8 @@ def ask_sync(text, timeout=25):
     from prompt_toolkit.application.run_in_terminal import run_in_terminal
 
     if not PT_ACTIVE.is_set():
-        _log("ask_sync: prompt_toolkit 未启用 → 裸 input()")
-        try:
-            return input(text), "fallback"
-        except (EOFError, KeyboardInterrupt):
-            return None, "eof"
+        _log("ask_sync: prompt_toolkit 未启用 → 带表的裸 input()")
+        return _input_with_timeout(text, timeout)
 
     app = wait_for_app(2.0)
     if app is None:

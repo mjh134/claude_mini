@@ -1,0 +1,38 @@
+# e2e_session_resume — EOF 优雅退出 + --resume 断点续聊 · suite=capability · runner=interactive
+# reference: 第一段进程里交代一个独特暗号（上下文+可写记忆），stdin EOF 走优雅收尾
+#   （run_turn 落盘 session.json → 退出收尾链），再 spawn --resume 第二段进程直接探针。
+#   判：新进程能答出暗号 —— 会话持久化/加载/恢复的端到端验收（ROADMAP 项 9 的
+#   真实入口版；库层格测不了 main.py 的加载路径）。
+
+id: e2e_session_resume
+runner: interactive
+suite: capability
+factor:
+  layer: cli_e2e
+  position: resume
+  dependency: recover
+setup:
+  files:
+  - path: seed_resume.txt
+    chars: 120
+    literal: "resume seed\n"
+acts:
+- "请记住一个暗号：RESUME-{{needle}}。只确认记下了即可，不要做别的事。"
+resume:
+  acts: []
+  probe:
+    say: "我的暗号是什么？只回答暗号本身。"
+    expect_exact: "RESUME-{{needle}}"
+graders:
+- type: state_check
+  probe:
+    expect_exact: "RESUME-{{needle}}"
+- type: budget
+  max_turns: 16
+budget:
+  max_turns: 16
+  max_minutes: 6
+permissions:
+  default: y
+trials: 1
+reference: "第一段记暗号→EOF 收尾→--resume 新进程探针答出 RESUME-<needle>。"

@@ -1,0 +1,81 @@
+# ============================================================
+# 密钥与凭据 —— 绝对不能进库
+# ============================================================
+.env
+.env.*
+!.env.example
+# 185 个 LLM 工具调用缓存。里面有 3 份整份 .env 的 dump,含真密钥明文
+tool_result/
+
+# ============================================================
+# Python 产物
+# ============================================================
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ============================================================
+# 运行态 —— agent 自己写的,不是源码
+# 刻意不入库:这样回退代码时,不会连带把记忆/任务/日志一起回退掉
+# ============================================================
+.task/
+memory/
+transcript
+*.log
+run_log.txt
+stress_log.txt
+# llm.py 每次请求覆盖重写的调试 dump。**没有密钥**(只有 when/model/messages),
+# 但里面有完整的思考文本、工具调用参数和模型回复原文 —— 和 tool_result/ 同一类:
+# 运行态产物,不是源码。而且每请求一次就变一次,提交进去只会变成持续噪音
+llm_request.json
+# compact.py 压缩前的整份 history 备份(只在触发压缩时写),同类运行态产物
+history_backup.json
+# 工具跑出来的产物(比如 py_line_count.md),同理不入库
+out/
+
+# ============================================================
+# 个人文档 —— 本地留存,暂不入库
+# ============================================================
+AGENTS.md
+CLAUDE.md
+DESIGN_NOTES.md
+LEARNING_ROADMAP.md
+
+# ============================================================
+# 本机个人配置 / 编辑器
+# ============================================================
+.claude/
+.zcode/
+.vscode/
+.idea/
+node_modules/
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+bower_components/
+jspm_packages/
+site-packages/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

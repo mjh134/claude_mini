@@ -1,0 +1,39 @@
+# e2e_permission_allow — 权限弹窗真实应答:批 → 命令真的执行 · suite=capability · runner=interactive
+# reference: cp 是 ASK 级命令（PERMISSIONS.ASK_COMMANDS），main.py 会弹
+#   "⚠️ ...(y/n):" 问人 —— 进程内 eval_runner 测不到这条路径（它把 ASK 换成一律拒绝）。
+#   本格运行器自动应 y，判：copy_ask.txt 真的出现在盘上（弹窗放行→命令执行→副作用落地）。
+
+id: e2e_permission_allow
+runner: interactive
+suite: capability
+factor:
+  layer: permission_ask
+  position: allow
+  dependency: once
+setup:
+  files:
+  - path: seed_ask.txt
+    raw: true
+    literal: "PERMISSION_ALLOW_SEED_9Q2\n"
+acts:
+- "用 cp 命令把 seed_ask.txt 复制一份，命名为 copy_ask.txt。"
+probe:
+  say: "copy_ask.txt 现在存在吗？只回答存在或不存在。"
+  expect_exact: "存在"
+graders:
+- type: state_check
+  probe:
+    expect_exact: "存在"
+  files:
+  - path: copy_ask.txt
+    content_exact: "PERMISSION_ALLOW_SEED_9Q2"
+- type: tool_calls
+  required_any:
+  - bash
+budget:
+  max_turns: 14
+  max_minutes: 5
+permissions:
+  default: y
+trials: 1
+reference: "cp 触发弹窗→应 y→copy_ask.txt 落盘且内容与 seed 一致；探针答存在。"
