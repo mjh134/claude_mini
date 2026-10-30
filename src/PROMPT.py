@@ -217,7 +217,15 @@ _ROLE_PARTS = {
 }
 
 
-def build_system_prompt(role):
+#角色 → 它的"身份切片"(你是谁那一格)。这是沙箱可顶替的**唯一**一格 ——
+#只有主agent有独立的身份段;成员/子agent 的第一段是共享的 _WORKFLOW(核心运转),
+#不能被顶替,否则就动到了"任务怎么推进"这套机制。没登记的 role 传 identity 会被忽略。
+_PERSONA_SLICE = {
+    ROLE_MAIN: _IDENTITY_MAIN,
+}
+
+
+def build_system_prompt(role, identity=None):
     """按角色拼出系统提示词。未知角色**报错**,不给一份空的让它裸奔。
 
     ★ 这个函数是"给哪段提示词"和"给哪些工具"合成一套的**提示词那一半** ——
@@ -225,12 +233,20 @@ def build_system_prompt(role):
       claude.py:118 的注释说"以前是两套并行机制,会互相漂移;现在合成一套",
       而当时只合了工具那半:提示词还是"所有人先拿主agent那份,成员再追加纠偏"。
       缺口就在这儿补上。
+
+    ★ identity 非 None 时,用它顶替该角色的**身份切片**(登记表 _PERSONA_SLICE),其余片段
+      (_WORKFLOW/_DELEGATE/_SCHEDULE 等核心运转)一字不动 —— 沙箱"换个你是谁"走这条路,
+      而权限层/自检/工作流不受影响(整份替换会绕过它们,见 decisions/0006 与 0007)。
+      identity=None(默认)时逐字节等同旧行为 —— 不带沙箱启动的字节级不变就靠这个。
     """
     parts = _ROLE_PARTS.get(role)
     if parts is None:
         raise ValueError(
             f"角色 {role!r} 没有登记提示词片段 —— 请在 _ROLE_PARTS 里给它一份。"
             f"已登记:{sorted(_ROLE_PARTS)}")
+    if identity is not None and role in _PERSONA_SLICE:
+        persona = _PERSONA_SLICE[role]
+        parts = tuple(identity if p is persona else p for p in parts)
     return "\n".join(parts)
 
 

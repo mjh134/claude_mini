@@ -1,4 +1,6 @@
 from datetime import datetime
+import os
+from pathlib import Path
 import threading
 from llm import LLM
 from TOOLS import (Tools, create_default_registry, tool_filter, check_roles,
@@ -31,6 +33,46 @@ OFFLINE_ACK_TIMEOUT_SECONDS = 120   #每一轮等多久
 OFFLINE_MAX_ROUNDS = 2              #总共给几轮:第一轮可以重发,第二轮结束就判定失灵(所以重发最多 1 次)
 OFFLINE_REQ_TEXT = ("主agent判断当前不再需要你,请做最终确认:如果还有没做完的工作、"
                     "还在等别人回复,就拒绝下线;确认可以结束了就同意下线。")
+
+
+def load_prompt_overlay():
+    """读 PROMPT_OVERLAY_FILE 指向的文件，返回要追加到角色提示词后面的一段；默认 ""。
+
+    沙箱装弹的**提示词**入口:正常启动不设 env,提示词逐字节不变;实验把 overlay 指到沙箱里的
+    文件,那段就追加进来。只追加不替换 —— 替换会绕过 build_system_prompt 的角色拼装与
+    check_prompts 自检,测出来的是没有权限层的世界(决策见 decisions/0006)。
+    故意不缓存:成员/子agent/job agent 构造时刻不同,都要现读一遍才能收敛到同一份 overlay。
+    """
+    ref = os.getenv("PROMPT_OVERLAY_FILE")
+    if not ref:
+        return ""
+    path = Path(ref)
+    if not path.is_file():
+        #外部缺失只告警不阻断(关键约束 13):沙箱目录不是代码,没建全就该照原样跑
+        ui.warn(f"[prompt] overlay 文件不存在,按无 overlay 启动:{path}")
+        return ""
+    return "\n\n" + path.read_text(encoding="utf-8")
+
+
+def load_prompt_identity():
+    """读 PROMPT_IDENTITY_FILE 指向的文件，返回要**顶替**内置身份切片的文本；默认 None。
+
+    沙箱装弹的**身份**入口：与 overlay(往角色提示词后面追加)不同，这条路是**替换**——
+    但它只换 PROMPT._PERSONA_SLICE 登记的那一格(你是谁)，_WORKFLOW/工具权限/check_prompts 一律不动。
+    env 未设 / 文件不存在 / 内容为空或全空白 → 返回 None，身份用内置默认，提示词字节级不变
+    (空身份文件当"我没设"，否则会拿空白把真身份抹掉)。文件缺失只告警不阻断(关键约束 13)。
+    """
+    ref = os.getenv("PROMPT_IDENTITY_FILE")
+    if not ref:
+        return None
+    path = Path(ref)
+    if not path.is_file():
+        ui.warn(f"[prompt] identity 文件不存在,按内置身份启动:{path}")
+        return None
+    text = path.read_text(encoding="utf-8")
+    if not text.strip():
+        return None     #空/全空白 = 不换身份
+    return text
 
 
 #时间格式化
@@ -129,7 +171,8 @@ class ClaudeMini():
         current_time = f"\n当前时间:{_now.strftime('%Y-%m-%d %H:%M')} 周{'一二三四五六日'[_now.weekday()]}"
 
         #构造对应角色提示词
-        head = build_system_prompt(role)
+        head = build_system_prompt(role, identity=load_prompt_identity())   #沙箱身份钩子:不换时 identity=None,字节级不变
+        head = head + load_prompt_overlay()      #沙箱装弹钩子:不设 env 恒为 "",提示词字节级不变
         if session_memory:
             head = head + "\n" + session_memory
         self.system_prompt = head + current_time + "\n" + "你可以使用以下skill解决相关问题:\n" + self.skill_loader.catalog()

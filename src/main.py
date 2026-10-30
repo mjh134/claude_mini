@@ -1,7 +1,9 @@
 import argparse
+import os
 import queue
 import threading
 import HOOKS
+import sandbox
 import ui
 import trace
 from claude import ClaudeMini
@@ -90,7 +92,28 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--resume", action="store_true",
                     help="恢复上次会话(断点续聊),上下文从上次结束处继续")
+    ap.add_argument("--sandbox", default="",
+                    help="用这个目录当实验环境(身份/提示词 overlay/记忆/skill/工作区);不存在则先建骨架")
     args = ap.parse_args()
+
+    #沙箱必须在 trace 与 agent 之前生效，三步的顺序是钉死的：
+    #  ①os.environ —— MemoryManager/SkillLoader/CompactManager/Trace 构造时才读 env，得先给它们
+    #  ②chdir —— 位置类变量已由 sandbox.env() 解成绝对路径，这里切 cwd 管的是 .task/、session、
+    #    以及工作文件；同时 load_dotenv 是从 cwd 往上找 .env 的，先切再读才不会读到沙箱里的野 .env
+    #  ③get_trace —— 它一落定就把 trace 目录锁住了，晚一步实验事件就混进真实 trace/ 了
+    #每次启动都重新带 --sandbox，不在退出时把环境恢复回真实项目——不为此加回滚分支
+    if args.sandbox:
+        root = sandbox.create(args.sandbox)
+        case = sandbox.load_case(root)        #声明式蓝图(可选):有 case.yaml 就自动铺弹
+        if case:
+            if case.get("fresh"):
+                sandbox.fresh_clean(root)      #铺弹前清上局运行产物(只擦 trace/tool_result/.task)
+            sandbox.materialize(root, case)    #以 case 为准覆写声明的那几格
+        os.environ.update(sandbox.env(root))
+        for problem in sandbox.check_env(root=root):
+            ui.warn(f"[sandbox] {problem}")
+        os.chdir(root)
+        ui.status(f"沙箱环境:{root}\n         装弹指纹:{sandbox.fingerprint(root)}")
 
     #显式初始化观测面(而不是等第一次建 agent 时懒建):
     #启动那一刻就把文件建出来,建不起来当场告警,别等对话到一半才发现没留 trace

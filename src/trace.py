@@ -1,10 +1,13 @@
 import json
+import os
 import re
 import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 import paths
 import ui
@@ -34,7 +37,9 @@ class Trace:
 
     #trace_dir/secrets 是给测试的注入口(临时目录 + 假指纹表);生产走 get_trace() 不带参
     def __init__(self, trace_dir=None, secrets=None):
-        self.dir = Path(trace_dir) if trace_dir else paths.PROJECT_ROOT / "trace"
+        #TRACE_DIR 是沙箱钩子:实验的 trace 落自己目录里,不混进真实 trace/(决策见 decisions/0006)
+        load_dotenv()
+        self.dir = Path(trace_dir) if trace_dir else paths.PROJECT_ROOT / os.getenv("TRACE_DIR", "trace")
         self.path = self.dir / f"sess-{datetime.now():%Y%m%d-%H%M%S}.jsonl"
         self.lock = threading.Lock()
         self.seq = 0

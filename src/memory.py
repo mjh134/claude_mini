@@ -15,7 +15,9 @@ BACKUP_RETAIN_DEFAULT = 5           # 整理前快照最多保留几份(超出�
 class MemoryManager:
 
     def __init__(self):
-        load_dotenv(override=True)
+        #不 override:位置类变量允许外部(沙箱/评测)显式指定并优先。
+        #凭证类(llm.py)反过来用 override=True —— 分界见 CONVENTIONS"环境变量约定"
+        load_dotenv()
         memory_dir = os.getenv("MEMORY_DIR", "memory")
         self.memory_dir = paths.PROJECT_ROOT / memory_dir
 
